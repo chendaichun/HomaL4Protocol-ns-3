@@ -25,6 +25,7 @@
  *           Tom Henderson <tomhend@u.washington.edu>
  */
 
+#include "ns3/ipv4-queue-disc-item.h"
 #include "ns3/log.h"
 #include "ns3/object-factory.h"
 #include "ns3/queue.h"
@@ -83,12 +84,10 @@ PfifoHomaQueueDisc::DoEnqueue (Ptr<QueueDiscItem> item)
     }
 
   uint8_t priority = 0;
-  SocketIpTosTag priorityTag;
-  if (item->GetPacket ()->PeekPacketTag (priorityTag))
+  auto ipv4Item = DynamicCast<Ipv4QueueDiscItem>(item);
+  if (ipv4Item)
     {
-//       NS_LOG_DEBUG("Found priority tag on the packet: " << 
-//                    (uint32_t)priorityTag.GetTos ());
-      priority = priorityTag.GetTos ();
+      priority = ipv4Item->GetHeader().GetTos();
     }
 
   uint32_t band = (uint32_t)priority;
