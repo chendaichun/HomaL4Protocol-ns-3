@@ -148,7 +148,6 @@ void MsgGeneratorApp::Start (Time start)
   NS_LOG_FUNCTION (this);
     
   SetStartTime(start);
-  DoInitialize();
 }
     
 void MsgGeneratorApp::Stop (Time stop)
