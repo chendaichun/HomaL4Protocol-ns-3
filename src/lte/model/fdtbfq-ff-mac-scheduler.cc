@@ -565,7 +565,6 @@ FdTbfqFfMacScheduler::DoSchedDlTriggerReq (const struct FfMacSchedSapProvider::S
     }
 
   // RACH Allocation
-  uint16_t rbAllocatedNum = 0;
   std::vector <bool> ulRbMap;
   ulRbMap.resize (m_cschedCellConfig.m_ulBandwidth, false);
   ulRbMap = m_ffrSapProvider->GetAvailableUlRbg ();
@@ -579,7 +578,6 @@ FdTbfqFfMacScheduler::DoSchedDlTriggerReq (const struct FfMacSchedSapProvider::S
     {
       if ((*it) == true )
         {
-          rbAllocatedNum++;
           if (tmpMinBandwidth > maxContinuousUlBandwidth)
             {
               maxContinuousUlBandwidth = tmpMinBandwidth;
@@ -1414,14 +1412,12 @@ FdTbfqFfMacScheduler::DoSchedDlTriggerReq (const struct FfMacSchedSapProvider::S
         {
           NS_LOG_INFO (this << " Layer " << (uint16_t)j << " CQI selected " << (uint16_t)worstCqi.at (j));
         }
-      uint32_t bytesTxed = 0;
       for (uint8_t j = 0; j < nLayer; j++)
         {
           newDci.m_mcs.push_back (m_amc->GetMcsFromCqi (worstCqi.at (j)));
           int tbSize = (m_amc->GetDlTbSizeFromMcs (newDci.m_mcs.at (j), RgbPerRnti * rbgSize) / 8); // (size of TB in bytes according to table 7.1.7.2.1-1 of 36.213)
           newDci.m_tbsSize.push_back (tbSize);
           NS_LOG_INFO (this << " Layer " << (uint16_t)j << " MCS selected" << (uint16_t) m_amc->GetMcsFromCqi (worstCqi.at (j)));
-          bytesTxed += tbSize;
         }
 
       newDci.m_resAlloc = 0;  // only allocation type 0 at this stage

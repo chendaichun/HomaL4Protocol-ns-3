@@ -29,6 +29,7 @@
 #include "ns3/integer.h"
 #include <algorithm>
 #include <random>
+#include <vector>
 #include "ns3/log.h"
 #include <ns3/simulator.h>
 #include "ns3/mobility-model.h"
@@ -1366,10 +1367,10 @@ ThreeGppChannelModel::GetNewChannel (Vector locUT, Ptr<const ChannelCondition> c
         }
     }
 
-  double rayAoa_radian[numReducedCluster][raysPerCluster]; //rayAoa_radian[n][m], where n is cluster index, m is ray index
-  double rayAod_radian[numReducedCluster][raysPerCluster]; //rayAod_radian[n][m], where n is cluster index, m is ray index
-  double rayZoa_radian[numReducedCluster][raysPerCluster]; //rayZoa_radian[n][m], where n is cluster index, m is ray index
-  double rayZod_radian[numReducedCluster][raysPerCluster]; //rayZod_radian[n][m], where n is cluster index, m is ray index
+  std::vector<std::vector<double>> rayAoa_radian (numReducedCluster, std::vector<double> (raysPerCluster)); //rayAoa_radian[n][m], where n is cluster index, m is ray index
+  std::vector<std::vector<double>> rayAod_radian (numReducedCluster, std::vector<double> (raysPerCluster)); //rayAod_radian[n][m], where n is cluster index, m is ray index
+  std::vector<std::vector<double>> rayZoa_radian (numReducedCluster, std::vector<double> (raysPerCluster)); //rayZoa_radian[n][m], where n is cluster index, m is ray index
+  std::vector<std::vector<double>> rayZod_radian (numReducedCluster, std::vector<double> (raysPerCluster)); //rayZod_radian[n][m], where n is cluster index, m is ray index
 
   for (uint8_t nInd = 0; nInd < numReducedCluster; nInd++)
     {
@@ -1520,10 +1521,10 @@ ThreeGppChannelModel::GetNewChannel (Vector locUT, Ptr<const ChannelCondition> c
   //shuffle all the arrays to perform random coupling
   for (uint8_t cIndex = 0; cIndex < numReducedCluster; cIndex++)
     {
-      Shuffle (&rayAod_radian[cIndex][0], &rayAod_radian[cIndex][raysPerCluster]);
-      Shuffle (&rayAoa_radian[cIndex][0], &rayAoa_radian[cIndex][raysPerCluster]);
-      Shuffle (&rayZod_radian[cIndex][0], &rayZod_radian[cIndex][raysPerCluster]);
-      Shuffle (&rayZoa_radian[cIndex][0], &rayZoa_radian[cIndex][raysPerCluster]);
+      Shuffle (rayAod_radian[cIndex].data (), rayAod_radian[cIndex].data () + raysPerCluster);
+      Shuffle (rayAoa_radian[cIndex].data (), rayAoa_radian[cIndex].data () + raysPerCluster);
+      Shuffle (rayZod_radian[cIndex].data (), rayZod_radian[cIndex].data () + raysPerCluster);
+      Shuffle (rayZoa_radian[cIndex].data (), rayZoa_radian[cIndex].data () + raysPerCluster);
     }
 
   //Step 9: Generate the cross polarization power ratios

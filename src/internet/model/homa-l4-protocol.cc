@@ -20,12 +20,14 @@
 
 #include <algorithm>
 #include <numeric>
+#include <sstream>
 
 #include "ns3/log.h"
 #include "ns3/assert.h"
 #include "ns3/packet.h"
 #include "ns3/node.h"
 #include "ns3/boolean.h"
+#include "ns3/double.h"
 #include "ns3/object-vector.h"
 #include "ns3/uinteger.h"
 
@@ -41,6 +43,72 @@
 
 namespace ns3 {
 
+namespace {
+
+enum PathRttTriggerKind : uint8_t
+{
+  PATH_RTT_INITIAL_CREDIT_REQUEST = 0,
+  PATH_RTT_FIRST_DATA = 1
+};
+
+struct PathRttResponseTxState
+{
+  uint8_t flags;
+  uint16_t grantOffset;
+  uint16_t pktOffset;
+  Time txTime;
+};
+
+struct PathRttFlowState
+{
+  bool haveTriggerTx = false;
+  Time triggerTxTime;
+  bool haveTriggerRx = false;
+  Time triggerRxTime;
+  uint8_t triggerKind = PATH_RTT_FIRST_DATA;
+  bool sampleEmitted = false;
+  std::vector<PathRttResponseTxState> responseTxStates;
+};
+
+static std::unordered_map<std::string, PathRttFlowState> g_pathRttFlowStates;
+
+static std::string
+MakePathRttKey (Ipv4Address sender,
+                Ipv4Address receiver,
+                uint16_t sport,
+                uint16_t dport,
+                uint16_t txMsgId)
+{
+  std::ostringstream key;
+  key << sender << ":" << sport
+      << " " << receiver << ":" << dport
+      << " " << txMsgId;
+  return key.str ();
+}
+
+static bool
+IsPathRttTriggerPacket (const HomaHeader& homaHeader)
+{
+  return (homaHeader.GetFlags () & HomaHeader::Flags_t::DATA) != 0 &&
+         homaHeader.GetPktOffset () == 0;
+}
+
+static uint8_t
+GetPathRttTriggerKind (const HomaHeader& homaHeader)
+{
+  return (homaHeader.GetPayloadSize () == 0) ? PATH_RTT_INITIAL_CREDIT_REQUEST
+                                             : PATH_RTT_FIRST_DATA;
+}
+
+static bool
+IsPathRttResponsePacket (const HomaHeader& homaHeader)
+{
+  return (homaHeader.GetFlags () & HomaHeader::Flags_t::GRANT) != 0 ||
+         (homaHeader.GetFlags () & HomaHeader::Flags_t::ACK) != 0;
+}
+
+} // namespace
+
 NS_LOG_COMPONENT_DEFINE ("HomaL4Protocol");
 
 NS_OBJECT_ENSURE_REGISTERED (HomaL4Protocol);
@@ -49,6 +117,7 @@ NS_OBJECT_ENSURE_REGISTERED (HomaL4Protocol);
 const uint8_t HomaL4Protocol::PROT_NUMBER = 198;
     
 TypeId 
+// 注册并返回 HomaL4Protocol 的 TypeId，同时声明可配置属性与跟踪源。
 HomaL4Protocol::GetTypeId (void)
 {
   static TypeId tid = TypeId ("ns3::HomaL4Protocol")
@@ -72,9 +141,49 @@ HomaL4Protocol::GetTypeId (void)
                    MakeUintegerAccessor (&HomaL4Protocol::m_numUnschedPrioBands),
                    MakeUintegerChecker<uint8_t> ())
     .AddAttribute ("OvercommitLevel", "Minimum number of messages to Grant at the same time",
-                   UintegerValue (6),
+                   UintegerValue (1),
                    MakeUintegerAccessor (&HomaL4Protocol::m_overcommitLevel),
                    MakeUintegerChecker<uint8_t> ())
+    .AddAttribute ("UseSrrScheduling", "If true, receiver orders active inbound messages in FIFO/SRR-like order instead of SRPT by remaining bytes.",
+             BooleanValue (false),
+             MakeBooleanAccessor (&HomaL4Protocol::m_useSrrScheduling),
+             MakeBooleanChecker ())
+    .AddAttribute ("SirdEnabled", "Enable SIRD-compatible receiver-driven control loops.",
+             BooleanValue (false),
+             MakeBooleanAccessor (&HomaL4Protocol::m_sirdEnabled),
+             MakeBooleanChecker ())
+    .AddAttribute ("SirdCreditBudgetPkts", "Baseline per-sender grant budget in packets.",
+             UintegerValue (12),
+             MakeUintegerAccessor (&HomaL4Protocol::m_sirdCreditBudgetPkts),
+             MakeUintegerChecker<uint16_t> (1))
+    .AddAttribute ("SirdUnschThresholdPkts", "Line-rate startup threshold in packets.",
+             UintegerValue (12),
+             MakeUintegerAccessor (&HomaL4Protocol::m_sirdUnschThresholdPkts),
+             MakeUintegerChecker<uint16_t> (1))
+    .AddAttribute ("SirdEcnMdFactor", "Multiplicative decrease factor for ECN loop.",
+             DoubleValue (0.85),
+             MakeDoubleAccessor (&HomaL4Protocol::m_sirdEcnMdFactor),
+             MakeDoubleChecker<double> (0.0, 1.0))
+    .AddAttribute ("SirdEcnAiStep", "Additive increase step in packets for ECN loop.",
+             DoubleValue (1.0),
+             MakeDoubleAccessor (&HomaL4Protocol::m_sirdEcnAiStep),
+             MakeDoubleChecker<double> (0.0))
+    .AddAttribute ("SirdSenderMdFactor", "Multiplicative decrease factor for sender feedback loop.",
+             DoubleValue (0.8),
+             MakeDoubleAccessor (&HomaL4Protocol::m_sirdSenderMdFactor),
+             MakeDoubleChecker<double> (0.0, 1.0))
+    .AddAttribute ("SirdSenderAiStep", "Additive increase step in packets for sender feedback loop.",
+             DoubleValue (1.0),
+             MakeDoubleAccessor (&HomaL4Protocol::m_sirdSenderAiStep),
+             MakeDoubleChecker<double> (0.0))
+    .AddAttribute ("SirdEcnAlphaGain", "EWMA gain for ECN CE-ratio estimation.",
+             DoubleValue (0.125),
+             MakeDoubleAccessor (&HomaL4Protocol::m_sirdEcnAlphaGain),
+             MakeDoubleChecker<double> (0.0, 1.0))
+    .AddAttribute ("SirdSenderCsnThreshold", "Accumulated credit threshold beyond which sender sets csn (packets).",
+             UintegerValue (20),
+             MakeUintegerAccessor (&HomaL4Protocol::m_sirdSenderCsnThreshold),
+             MakeUintegerChecker<uint16_t> (0))
     .AddAttribute ("InbndRtxTimeout", "Time value to determine the retransmission timeout of InboundMsgs",
                    TimeValue (MilliSeconds (1)),
                    MakeTimeAccessor (&HomaL4Protocol::m_inboundRtxTimeout),
@@ -117,10 +226,32 @@ HomaL4Protocol::GetTypeId (void)
                      "to the HomaL4Protocol layer.",
                      MakeTraceSourceAccessor (&HomaL4Protocol::m_ctrlRecvTrace),
                      "ns3::Packet::TracedCallback")
+    .AddTraceSource ("CtrlPktArrivalTxMsg",
+                     "Trace source indicating a control packet has arrived "
+                     "to the HomaL4Protocol layer, including txMsgId.",
+                     MakeTraceSourceAccessor (&HomaL4Protocol::m_ctrlRecvTxMsgTrace),
+                     "ns3::Packet::TracedCallback")
+    .AddTraceSource ("PathRtt",
+                     "Trace source for pure path RTT samples derived from Homa packet timing.",
+                     MakeTraceSourceAccessor (&HomaL4Protocol::m_pathRttTrace),
+                     "ns3::TracedCallback")
+    .AddTraceSource ("SirdGrantDecision",
+                     "Trace source for SIRD grant decisions.",
+                     MakeTraceSourceAccessor (&HomaL4Protocol::m_sirdGrantDecisionTrace),
+                     "ns3::TracedCallback")//上面 3 个 trace 已经弃用
+    .AddTraceSource ("SirdBucketState",
+                     "Trace source for SIRD per-sender/global bucket state.",
+                     MakeTraceSourceAccessor (&HomaL4Protocol::m_sirdBucketStateTrace),
+                     "ns3::TracedCallback")
+    .AddTraceSource ("SirdPacketState",
+                     "Trace source for per-packet SIRD state (flags/credit/CE/CSN).",
+                     MakeTraceSourceAccessor (&HomaL4Protocol::m_sirdPacketStateTrace),
+                     "ns3::TracedCallback")
   ;
   return tid;
 }
     
+// 构造函数：初始化端点复用器，并创建发送/接收两个核心调度器对象。
 HomaL4Protocol::HomaL4Protocol ()
   : m_endPoints (new Ipv4EndPointDemux ())
 {
@@ -130,12 +261,14 @@ HomaL4Protocol::HomaL4Protocol ()
   m_recvScheduler = CreateObject<HomaRecvScheduler> (this); 
 }
 
+// 析构函数：当前仅做日志记录，资源释放由 DoDispose 统一完成。
 HomaL4Protocol::~HomaL4Protocol ()
 {
   NS_LOG_FUNCTION_NOARGS ();
 }
     
 void 
+// 将协议实例绑定到节点，读取底层网卡 MTU/链路速率，并初始化发送队列空闲时间。
 HomaL4Protocol::SetNode (Ptr<Node> node)
 {
   m_node = node;
@@ -150,65 +283,210 @@ HomaL4Protocol::SetNode (Ptr<Node> node)
 }
     
 Ptr<Node> 
+// 读取并返回当前对象中的配置或运行时状态值（只读访问，不修改内部状态）。
 HomaL4Protocol::GetNode(void) const
 {
   return m_node;
 }
     
 uint32_t
+// 读取并返回当前对象中的配置或运行时状态值（只读访问，不修改内部状态）。
 HomaL4Protocol::GetMtu (void) const
 {
   return m_mtu;
 }
     
 uint16_t 
+// 读取并返回当前对象中的配置或运行时状态值（只读访问，不修改内部状态）。
 HomaL4Protocol::GetBdp(void) const
 {
   return m_bdp;
 }
+
+Time
+HomaL4Protocol::GetFullDataPktTxTime (void) const
+{
+  PppHeader ppp;
+  return m_linkRate.CalculateBytesTxTime (m_mtu + ppp.GetSerializedSize ());
+}
     
 int 
+// 读取并返回当前对象中的配置或运行时状态值（只读访问，不修改内部状态）。
 HomaL4Protocol::GetProtocolNumber (void) const
 {
   return PROT_NUMBER;
 }
  
 Time
+// 读取并返回当前对象中的配置或运行时状态值（只读访问，不修改内部状态）。
 HomaL4Protocol::GetInboundRtxTimeout(void) const
 {
   return m_inboundRtxTimeout;
 }
     
 Time
+// 读取并返回当前对象中的配置或运行时状态值（只读访问，不修改内部状态）。
 HomaL4Protocol::GetOutboundRtxTimeout(void) const
 {
   return m_outboundRtxTimeout;
 }
     
 uint16_t 
+// 读取并返回当前对象中的配置或运行时状态值（只读访问，不修改内部状态）。
 HomaL4Protocol::GetMaxNumRtxPerMsg(void) const
 {
   return m_maxNumRtxPerMsg;
 }
     
 uint8_t
+// 读取并返回当前对象中的配置或运行时状态值（只读访问，不修改内部状态）。
 HomaL4Protocol::GetNumTotalPrioBands (void) const
 {
   return m_numTotalPrioBands;
 }
     
 uint8_t
+// 读取并返回当前对象中的配置或运行时状态值（只读访问，不修改内部状态）。
 HomaL4Protocol::GetNumUnschedPrioBands (void) const
 {
   return m_numUnschedPrioBands;
 }
     
 uint8_t
+// 读取并返回当前对象中的配置或运行时状态值（只读访问，不修改内部状态）。
 HomaL4Protocol::GetOvercommitLevel (void) const
 {
   return m_overcommitLevel;
 }
+
+bool
+// 根据当前状态进行条件判断，返回布尔决策供上层流程分支使用。
+HomaL4Protocol::UseSrrScheduling (void) const
+{
+  return m_useSrrScheduling;
+}
+
+bool
+// 根据当前状态进行条件判断，返回布尔决策供上层流程分支使用。
+HomaL4Protocol::IsSirdEnabled (void) const
+{
+  return m_sirdEnabled;
+}
+
+uint16_t
+// 读取并返回当前对象中的配置或运行时状态值（只读访问，不修改内部状态）。
+HomaL4Protocol::GetSirdCreditBudgetPkts (void) const
+{
+  return m_sirdCreditBudgetPkts;
+}
+
+uint16_t
+// 读取并返回当前对象中的配置或运行时状态值（只读访问，不修改内部状态）。
+HomaL4Protocol::GetSirdUnschThresholdPkts (void) const
+{
+  return m_sirdUnschThresholdPkts;
+}
+
+double
+// 读取并返回当前对象中的配置或运行时状态值（只读访问，不修改内部状态）。
+HomaL4Protocol::GetSirdEcnMdFactor (void) const
+{
+  return m_sirdEcnMdFactor;
+}
+
+double
+// 读取并返回当前对象中的配置或运行时状态值（只读访问，不修改内部状态）。
+HomaL4Protocol::GetSirdEcnAiStep (void) const
+{
+  return m_sirdEcnAiStep;
+}
+
+double
+// 读取并返回当前对象中的配置或运行时状态值（只读访问，不修改内部状态）。
+HomaL4Protocol::GetSirdSenderMdFactor (void) const
+{
+  return m_sirdSenderMdFactor;
+}
+
+double
+// 读取并返回当前对象中的配置或运行时状态值（只读访问，不修改内部状态）。
+HomaL4Protocol::GetSirdSenderAiStep (void) const
+{
+  return m_sirdSenderAiStep;
+}
+
+double
+// 读取并返回当前对象中的配置或运行时状态值（只读访问，不修改内部状态）。
+HomaL4Protocol::GetSirdEcnAlphaGain (void) const
+{
+  return m_sirdEcnAlphaGain;
+}
+
+uint16_t
+// 读取并返回当前对象中的配置或运行时状态值（只读访问，不修改内部状态）。
+HomaL4Protocol::GetSirdSenderCsnThreshold (void) const
+{
+  return m_sirdSenderCsnThreshold;
+}
+
+void
+// 封装 SIRD 授权决策的 trace 回调，向外暴露发送方预算与拥塞状态。
+HomaL4Protocol::TraceSirdGrantDecision (Ipv4Address sender,
+                                        uint16_t txMsgId,
+                                        uint16_t grantOffset,
+                                        double senderBudgetPkts,
+                                        double ecnEwma,
+                                        bool senderCsn)
+{
+  m_sirdGrantDecisionTrace (sender,
+                            txMsgId,
+                            grantOffset,
+                            senderBudgetPkts,
+                            ecnEwma,
+                            senderCsn);
+}
+
+void
+// 封装 SIRD bucket 状态的 trace 回调，便于观测 per-sender/global credit 变化。
+HomaL4Protocol::TraceSirdBucketState (Ipv4Address receiver,
+                                      Ipv4Address sender,
+                                      double senderBudgetHostPkts,
+                                      uint32_t senderCreditsInUsePkts,
+                                      uint32_t globalCreditsInUsePkts,
+                                      uint32_t globalBudgetPkts,
+                                      uint8_t eventType)
+{
+  m_sirdBucketStateTrace (receiver,
+                          sender,
+                          senderBudgetHostPkts,
+                          senderCreditsInUsePkts,
+                          globalCreditsInUsePkts,
+                          globalBudgetPkts,
+                          eventType);
+}
+
+void
+// 封装每包状态 trace 回调，暴露 flags/credit/CE/CSN 等关键字段。
+HomaL4Protocol::TraceSirdPacketState (Ipv4Address receiver,
+                                      Ipv4Address sender,
+                                      uint8_t flags,
+                                      uint32_t msgPktState,
+                                      uint16_t grantOffset,
+                                      uint8_t ecn,
+                                      bool csn,
+                                      uint32_t creditState)
+{
+  m_sirdPacketStateTrace (receiver,
+                          sender,
+                          flags,
+                          msgPktState,
+                          grantOffset,
+                          ecn,
+                          csn,
+                          creditState);
+}
     
+// 根据当前状态进行条件判断，返回布尔决策供上层流程分支使用。
 bool HomaL4Protocol::MemIsOptimized (void)
 {
   return m_memIsOptimized;
@@ -220,6 +498,7 @@ bool HomaL4Protocol::MemIsOptimized (void)
  * present in the node along with the socket factory
  */
 void
+// 完成与 Node/IPv4 的聚合绑定，创建 SocketFactory，并注册到 IPv4 上下行路径。
 HomaL4Protocol::NotifyNewAggregate ()
 {
   NS_LOG_FUNCTION (this);
@@ -256,6 +535,7 @@ HomaL4Protocol::NotifyNewAggregate ()
 }
     
 void
+// 释放协议层对象持有的 socket/endPoint 等资源，并断开下行回调。
 HomaL4Protocol::DoDispose (void)
 {
   NS_LOG_FUNCTION_NOARGS ();
@@ -284,6 +564,7 @@ HomaL4Protocol::DoDispose (void)
  * returns a socket that is tied to this HomaL4Protocol instance.
  */
 Ptr<Socket>
+// 创建并初始化一个 HomaSocket，使其与当前节点和协议实例关联。
 HomaL4Protocol::CreateSocket (void)
 {
   NS_LOG_FUNCTION_NOARGS ();
@@ -295,6 +576,7 @@ HomaL4Protocol::CreateSocket (void)
 }
     
 Ipv4EndPoint *
+// 向端点复用器申请本地端点（支持不同绑定粒度的重载形式）。
 HomaL4Protocol::Allocate (void)
 {
   NS_LOG_FUNCTION (this);
@@ -302,6 +584,7 @@ HomaL4Protocol::Allocate (void)
 }
 
 Ipv4EndPoint *
+// 向端点复用器申请本地端点（支持不同绑定粒度的重载形式）。
 HomaL4Protocol::Allocate (Ipv4Address address)
 {
   NS_LOG_FUNCTION (this << address);
@@ -309,6 +592,7 @@ HomaL4Protocol::Allocate (Ipv4Address address)
 }
 
 Ipv4EndPoint *
+// 向端点复用器申请本地端点（支持不同绑定粒度的重载形式）。
 HomaL4Protocol::Allocate (Ptr<NetDevice> boundNetDevice, uint16_t port)
 {
   NS_LOG_FUNCTION (this << boundNetDevice << port);
@@ -316,12 +600,14 @@ HomaL4Protocol::Allocate (Ptr<NetDevice> boundNetDevice, uint16_t port)
 }
 
 Ipv4EndPoint *
+// 向端点复用器申请本地端点（支持不同绑定粒度的重载形式）。
 HomaL4Protocol::Allocate (Ptr<NetDevice> boundNetDevice, Ipv4Address address, uint16_t port)
 {
   NS_LOG_FUNCTION (this << boundNetDevice << address << port);
   return m_endPoints->Allocate (boundNetDevice, address, port);
 }
 Ipv4EndPoint *
+// 向端点复用器申请本地端点（支持不同绑定粒度的重载形式）。
 HomaL4Protocol::Allocate (Ptr<NetDevice> boundNetDevice,
                          Ipv4Address localAddress, uint16_t localPort,
                          Ipv4Address peerAddress, uint16_t peerPort)
@@ -333,6 +619,7 @@ HomaL4Protocol::Allocate (Ptr<NetDevice> boundNetDevice,
 }
 
 void 
+// 归还此前分配的 IPv4 端点，释放端口绑定状态。
 HomaL4Protocol::DeAllocate (Ipv4EndPoint *endPoint)
 {
   NS_LOG_FUNCTION (this << endPoint);
@@ -340,6 +627,7 @@ HomaL4Protocol::DeAllocate (Ipv4EndPoint *endPoint)
 }
     
 void
+// 应用层发送入口：构造 OutboundMsg 并交给发送调度器分配 txMsgId 与后续发送时机。
 HomaL4Protocol::Send (Ptr<Packet> message, 
                      Ipv4Address saddr, Ipv4Address daddr, 
                      uint16_t sport, uint16_t dport)
@@ -350,6 +638,7 @@ HomaL4Protocol::Send (Ptr<Packet> message,
 }
     
 void
+// 应用层发送入口：构造 OutboundMsg 并交给发送调度器分配 txMsgId 与后续发送时机。
 HomaL4Protocol::Send (Ptr<Packet> message, 
                      Ipv4Address saddr, Ipv4Address daddr, 
                      uint16_t sport, uint16_t dport, Ptr<Ipv4Route> route)
@@ -373,6 +662,7 @@ HomaL4Protocol::Send (Ptr<Packet> message,
  * packet is then pushed down to the lower IP layer.
  */
 void
+// 统一下发出口：更新链路序列化队列时间，记录发送 trace，并调用 IPv4 下行回调。
 HomaL4Protocol::SendDown (Ptr<Packet> packet, 
                           Ipv4Address saddr, Ipv4Address daddr, 
                           Ptr<Ipv4Route> route)
@@ -405,11 +695,46 @@ HomaL4Protocol::SendDown (Ptr<Packet> packet,
     m_dataSendTrace(packet, saddr, daddr, homaHeader.GetSrcPort (), 
                     homaHeader.GetDstPort (), homaHeader.GetTxMsgId (), 
                     homaHeader.GetPktOffset (), remainingPkts);
+
+    if (IsPathRttTriggerPacket (homaHeader))
+      {
+        std::string key = MakePathRttKey (saddr,
+                                          daddr,
+                                          homaHeader.GetSrcPort (),
+                                          homaHeader.GetDstPort (),
+                                          homaHeader.GetTxMsgId ());
+        PathRttFlowState& state = g_pathRttFlowStates[key];
+        if (!state.sampleEmitted && !state.haveTriggerTx)
+          {
+            state.haveTriggerTx = true;
+            state.triggerTxTime = Simulator::Now ();
+            state.triggerKind = GetPathRttTriggerKind (homaHeader);
+          }
+      }
+  }
+  else if (IsPathRttResponsePacket (homaHeader))
+  {
+    std::string key = MakePathRttKey (daddr,
+                                      saddr,
+                                      homaHeader.GetDstPort (),
+                                      homaHeader.GetSrcPort (),
+                                      homaHeader.GetTxMsgId ());
+    auto it = g_pathRttFlowStates.find (key);
+    if (it != g_pathRttFlowStates.end () &&
+        !it->second.sampleEmitted &&
+        it->second.haveTriggerRx)
+      {
+        it->second.responseTxStates.push_back ({homaHeader.GetFlags (),
+                                                homaHeader.GetGrantOffset (),
+                                                homaHeader.GetPktOffset (),
+                                                Simulator::Now ()});
+      }
   }
    
   m_downTarget (packet, saddr, daddr, PROT_NUMBER, route);
 }
     
+// 估算当前发送队列还需多久排空，供发送调度器决定下一次触发时机。
 Time HomaL4Protocol::GetTimeToDrainTxQueue ()
 {
   NS_LOG_FUNCTION(this);
@@ -431,6 +756,7 @@ Time HomaL4Protocol::GetTimeToDrainTxQueue ()
  * Homa Transport logic applied on it.
  */
 enum IpL4Protocol::RxStatus
+// 网络接收入口：校验报文并按 DATA/BUSY 与 GRANT/RESEND/ACK 分发到接收或发送调度器。
 HomaL4Protocol::Receive (Ptr<Packet> packet,
                         Ipv4Header const &header,
                         Ptr<Ipv4Interface> interface)
@@ -444,7 +770,9 @@ HomaL4Protocol::Receive (Ptr<Packet> packet,
   Ptr<Packet> cp = packet->Copy ();
     
   HomaHeader homaHeader;
-  cp->RemoveHeader(homaHeader);
+  cp->RemoveHeader(homaHeader);//homaHeader：拿到了包里的 Homa 头字段
+  //cp：头已经被移除，只剩 payload
+
   NS_ASSERT_MSG(cp->GetSize()==homaHeader.GetPayloadSize(),
                 "HomaL4Protocol (" << this << ") received a packet "
                 " whose payload size doesn't match the homa header field!");
@@ -461,16 +789,75 @@ HomaL4Protocol::Receive (Ptr<Packet> packet,
     
   //  The Homa protocol logic starts here!
   uint8_t rxFlag = homaHeader.GetFlags ();
+  if (rxFlag & HomaHeader::Flags_t::DATA)
+    {
+      if (IsPathRttTriggerPacket (homaHeader))
+        {
+          std::string key = MakePathRttKey (header.GetSource (),
+                                            header.GetDestination (),
+                                            homaHeader.GetSrcPort (),
+                                            homaHeader.GetDstPort (),
+                                            homaHeader.GetTxMsgId ());
+          PathRttFlowState& state = g_pathRttFlowStates[key];
+          if (!state.sampleEmitted && !state.haveTriggerRx)
+            {
+              state.haveTriggerRx = true;
+              state.triggerRxTime = Simulator::Now ();
+              state.triggerKind = GetPathRttTriggerKind (homaHeader);
+            }
+        }
+    }
+  else if (IsPathRttResponsePacket (homaHeader))
+    {
+      std::string key = MakePathRttKey (header.GetDestination (),
+                                        header.GetSource (),
+                                        homaHeader.GetDstPort (),
+                                        homaHeader.GetSrcPort (),
+                                        homaHeader.GetTxMsgId ());
+      auto stateIt = g_pathRttFlowStates.find (key);
+      if (stateIt != g_pathRttFlowStates.end () &&
+          !stateIt->second.sampleEmitted &&
+          stateIt->second.haveTriggerTx &&
+          stateIt->second.haveTriggerRx)
+        {
+          auto& responseTxStates = stateIt->second.responseTxStates;
+          for (auto respIt = responseTxStates.begin (); respIt != responseTxStates.end (); ++respIt)
+            {
+              if (respIt->flags == homaHeader.GetFlags () &&
+                  respIt->grantOffset == homaHeader.GetGrantOffset () &&
+                  respIt->pktOffset == homaHeader.GetPktOffset ())
+                {
+                  Time receiverDelay = respIt->txTime - stateIt->second.triggerRxTime;
+                  Time pathRtt = (Simulator::Now () - stateIt->second.triggerTxTime) - receiverDelay;
+                  if (pathRtt.GetNanoSeconds () >= 0)
+                    {
+                      m_pathRttTrace (header.GetDestination (),
+                                      header.GetSource (),
+                                      homaHeader.GetDstPort (),
+                                      homaHeader.GetSrcPort (),
+                                      homaHeader.GetTxMsgId (),
+                                      stateIt->second.triggerKind,
+                                      homaHeader.GetFlags (),
+                                      pathRtt);
+                    }
+                  stateIt->second.sampleEmitted = true;
+                  stateIt->second.responseTxStates.clear ();
+                  break;
+                }
+            }
+        }
+    }
+
   if (rxFlag & HomaHeader::Flags_t::DATA ||
       rxFlag & HomaHeader::Flags_t::BUSY)
   {
-    m_recvScheduler->ReceivePacket(cp, header, homaHeader, interface);
+    m_recvScheduler->ReceivePacket(cp, header, homaHeader, interface);//是 Data 或者 Busy 包，调度器受着
   }
   else if ((rxFlag & HomaHeader::Flags_t::GRANT) ||
            (rxFlag & HomaHeader::Flags_t::RESEND) ||
            (rxFlag & HomaHeader::Flags_t::ACK))
   {
-    m_sendScheduler->CtrlPktRecvdForOutboundMsg(header, homaHeader);
+    m_sendScheduler->CtrlPktRecvdForOutboundMsg(header, homaHeader);//收到控制包
   }
   else
   {
@@ -483,17 +870,35 @@ HomaL4Protocol::Receive (Ptr<Packet> packet,
     m_dataRecvTrace(cp, header.GetSource (), header.GetDestination (), 
                     homaHeader.GetSrcPort (), homaHeader.GetDstPort (), 
                     homaHeader.GetTxMsgId (), homaHeader.GetPktOffset (), 
-                    homaHeader.GetPrio ());
+                    homaHeader.GetPrio ());//trace 用
   else
+  {
     m_ctrlRecvTrace(cp, header.GetSource (), header.GetDestination (), 
                     homaHeader.GetSrcPort (), homaHeader.GetDstPort (), 
                     homaHeader.GetFlags (), homaHeader.GetGrantOffset(), 
                     homaHeader.GetPrio());
+    m_ctrlRecvTxMsgTrace(header.GetSource (), header.GetDestination (),
+                         homaHeader.GetSrcPort (), homaHeader.GetDstPort (),
+                         homaHeader.GetTxMsgId (), homaHeader.GetFlags (),
+                         homaHeader.GetGrantOffset (), homaHeader.GetPrio ());
+    uint8_t ecn = static_cast<uint8_t> (header.GetEcn ());
+    bool csn = (homaHeader.GetFeedbackFlags () & HomaHeader::FeedbackFlags_t::FEEDBACK_CSN) != 0;
+    TraceSirdPacketState (header.GetDestination (),
+                          header.GetSource (),
+                          homaHeader.GetFlags (),
+                          (static_cast<uint32_t> (homaHeader.GetTxMsgId ()) << 16) |
+                            static_cast<uint32_t> (homaHeader.GetPktOffset ()),
+                          homaHeader.GetGrantOffset (),
+                          ecn,
+                          csn,
+                          0);
+  }
     
   return IpL4Protocol::RX_OK;
 }
     
 enum IpL4Protocol::RxStatus
+// 网络接收入口：校验报文并按 DATA/BUSY 与 GRANT/RESEND/ACK 分发到接收或发送调度器。
 HomaL4Protocol::Receive (Ptr<Packet> packet,
                         Ipv6Header const &header,
                         Ptr<Ipv6Interface> interface)
@@ -506,6 +911,7 @@ HomaL4Protocol::Receive (Ptr<Packet> packet,
  * This method is called by the HomaRecvScheduler everytime a message is ready to
  * be forwarded up to the applications. 
  */
+// 将完整重组后的消息按四元组查找端点并上交应用，同时触发消息完成 trace。
 void HomaL4Protocol::ForwardUp (Ptr<Packet> completeMsg,
                                 const Ipv4Header &header,
                                 uint16_t sport, uint16_t dport, uint16_t txMsgId,
@@ -533,6 +939,7 @@ void HomaL4Protocol::ForwardUp (Ptr<Packet> completeMsg,
 
 // inherited from Ipv4L4Protocol (Not used for Homa Transport Purposes)
 void 
+// 处理 ICMP 反馈：解析原始端口并转交对应端点，便于上层感知网络错误。
 HomaL4Protocol::ReceiveIcmp (Ipv4Address icmpSource, uint8_t icmpTtl,
                             uint8_t icmpType, uint8_t icmpCode, uint32_t icmpInfo,
                             Ipv4Address payloadSource,Ipv4Address payloadDestination,
@@ -560,6 +967,7 @@ HomaL4Protocol::ReceiveIcmp (Ipv4Address icmpSource, uint8_t icmpTtl,
 }
     
 void
+// 设置 IPv4 下行发送回调，使 Homa 能把封装后的分组交给网络层。
 HomaL4Protocol::SetDownTarget (IpL4Protocol::DownTargetCallback callback)
 {
   NS_LOG_FUNCTION (this);
@@ -567,6 +975,7 @@ HomaL4Protocol::SetDownTarget (IpL4Protocol::DownTargetCallback callback)
 }
     
 void
+// IPv6 下行回调设置接口；当前实现明确不支持 IPv6 并直接报错。
 HomaL4Protocol::SetDownTarget6 (IpL4Protocol::DownTargetCallback6 callback)
 {
   NS_LOG_FUNCTION (this);
@@ -575,12 +984,14 @@ HomaL4Protocol::SetDownTarget6 (IpL4Protocol::DownTargetCallback6 callback)
 }
 
 IpL4Protocol::DownTargetCallback
+// 读取并返回当前对象中的配置或运行时状态值（只读访问，不修改内部状态）。
 HomaL4Protocol::GetDownTarget (void) const
 {
   return m_downTarget;
 }
     
 IpL4Protocol::DownTargetCallback6
+// 读取并返回当前对象中的配置或运行时状态值（只读访问，不修改内部状态）。
 HomaL4Protocol::GetDownTarget6 (void) const
 {
   NS_FATAL_ERROR("HomaL4Protocol currently doesn't support IPv6. Use IPv4 instead.");
@@ -589,6 +1000,7 @@ HomaL4Protocol::GetDownTarget6 (void) const
 
 /******************************************************************************/
 
+// 注册并返回 HomaOutboundMsg 的 TypeId。
 TypeId HomaOutboundMsg::GetTypeId (void)
 {
   static TypeId tid = TypeId ("ns3::HomaOutboundMsg")
@@ -601,6 +1013,7 @@ TypeId HomaOutboundMsg::GetTypeId (void)
 /*
  * This method creates a new outbound message with the given information.
  */
+// 构造发送侧消息状态：分片、初始化可发送窗口、以及 SIRD 首包授权等待策略。
 HomaOutboundMsg::HomaOutboundMsg (Ptr<Packet> message, 
                                   Ipv4Address saddr, Ipv4Address daddr, 
                                   uint16_t sport, uint16_t dport, 
@@ -608,6 +1021,8 @@ HomaOutboundMsg::HomaOutboundMsg (Ptr<Packet> message,
     : m_route(0),
       m_prio(0),
       m_prioSetByReceiver(false),
+  m_waitForFirstGrant(false),
+  m_initialCreditRequestSent(false),
       m_isExpired(false)
 {
   NS_LOG_FUNCTION (this);
@@ -652,7 +1067,28 @@ HomaOutboundMsg::HomaOutboundMsg (Ptr<Packet> message,
   } 
   NS_ASSERT(numPkts == m_msgSizeBytes / m_maxPayloadSize + (m_msgSizeBytes % m_maxPayloadSize != 0));
   
-  m_maxGrantedIdx = std::min((uint16_t)(m_homa->GetBdp () -1), numPkts);
+  if (numPkts == 0)
+  {
+    m_maxGrantedIdx = 0;
+  }
+  else if (m_homa->IsSirdEnabled ())
+  {
+    uint16_t unschThresholdPkts = std::max<uint16_t> (1, m_homa->GetSirdUnschThresholdPkts ());
+    if (numPkts > unschThresholdPkts)
+    {
+      // For long messages, require explicit GRANT before the first data packet.
+      m_maxGrantedIdx = 0;
+      m_waitForFirstGrant = true;
+    }
+    else
+    {
+      m_maxGrantedIdx = std::min((uint16_t)(m_homa->GetBdp () - 1), (uint16_t)(numPkts - 1));
+    }
+  }
+  else
+  {
+    m_maxGrantedIdx = std::min((uint16_t)(m_homa->GetBdp () -1), numPkts);
+  }
           
   // FIX: There is no timeout mechanism on the sender side for Homa 
   //      (even for garbage collection purposes), so removing the following
@@ -661,65 +1097,78 @@ HomaOutboundMsg::HomaOutboundMsg (Ptr<Packet> message,
   //                                   this, m_maxGrantedIdx);
 }
 
+// 析构函数：当前无额外清理逻辑，保留日志便于调试生命周期。
 HomaOutboundMsg::~HomaOutboundMsg ()
 {
   NS_LOG_FUNCTION_NOARGS ();
 }
 
+// 记录消息可选路由信息，供发送下发时透传给 IPv4。
 void HomaOutboundMsg::SetRoute(Ptr<Ipv4Route> route)
 {
   m_route = route;
 }
     
+// 读取并返回当前对象中的配置或运行时状态值（只读访问，不修改内部状态）。
 Ptr<Ipv4Route> HomaOutboundMsg::GetRoute ()
 {
   return m_route;
 }
     
+// 读取并返回当前对象中的配置或运行时状态值（只读访问，不修改内部状态）。
 uint32_t HomaOutboundMsg::GetRemainingBytes()
 {
   return m_remainingBytes;
 }
 
+// 读取并返回当前对象中的配置或运行时状态值（只读访问，不修改内部状态）。
 uint32_t HomaOutboundMsg::GetMsgSizeBytes()
 {
   return m_msgSizeBytes;
 }
+// 读取并返回当前对象中的配置或运行时状态值（只读访问，不修改内部状态）。
 uint16_t HomaOutboundMsg::GetMsgSizePkts()
 {
   return m_msgSizeBytes / m_maxPayloadSize + (m_msgSizeBytes % m_maxPayloadSize != 0);
 }
     
+// 读取并返回当前对象中的配置或运行时状态值（只读访问，不修改内部状态）。
 Ipv4Address HomaOutboundMsg::GetSrcAddress ()
 {
   return m_saddr;
 }
     
+// 读取并返回当前对象中的配置或运行时状态值（只读访问，不修改内部状态）。
 Ipv4Address HomaOutboundMsg::GetDstAddress ()
 {
   return m_daddr;
 }
 
+// 读取并返回当前对象中的配置或运行时状态值（只读访问，不修改内部状态）。
 uint16_t HomaOutboundMsg::GetSrcPort ()
 {
   return m_sport;
 }
     
+// 读取并返回当前对象中的配置或运行时状态值（只读访问，不修改内部状态）。
 uint16_t HomaOutboundMsg::GetDstPort ()
 {
   return m_dport;
 }
     
+// 读取并返回当前对象中的配置或运行时状态值（只读访问，不修改内部状态）。
 uint16_t HomaOutboundMsg::GetMaxGrantedIdx ()
 {
   return m_maxGrantedIdx;
 }
     
+// 根据当前状态进行条件判断，返回布尔决策供上层流程分支使用。
 bool HomaOutboundMsg::IsExpired ()
 {
   return m_isExpired;
 }
     
+// 读取并返回当前对象中的配置或运行时状态值（只读访问，不修改内部状态）。
 uint8_t HomaOutboundMsg::GetPrio (uint16_t pktOffset)
 {
   if (!m_prioSetByReceiver)
@@ -735,14 +1184,23 @@ uint8_t HomaOutboundMsg::GetPrio (uint16_t pktOffset)
   return m_prio;
 }
     
+// 读取并返回当前对象中的配置或运行时状态值（只读访问，不修改内部状态）。
 EventId HomaOutboundMsg::GetRtxEvent ()
 {
   return m_rtxEvent;
 }
     
+// 从发送队列挑选当前可发分片：需同时满足未发送且不超过授权上界。
 bool HomaOutboundMsg::GetNextPktOffset (uint16_t &pktOffset)
 {
   NS_LOG_FUNCTION (this);
+
+  if (m_waitForFirstGrant)
+  {
+    NS_LOG_LOGIC("HomaOutboundMsg (" << this
+                 << ") is waiting for first explicit GRANT before data transmission.");
+    return false;
+  }
     
   if (!m_pktTxQ.empty ())
   {
@@ -761,7 +1219,44 @@ bool HomaOutboundMsg::GetNextPktOffset (uint16_t &pktOffset)
                << ") doesn't have any packet to send!");
   return false;
 }
+
+// 判断长消息是否需要先发零负载 DATA 作为首轮信用请求。
+bool HomaOutboundMsg::NeedsInitialCreditRequest (void) const
+{
+  return m_waitForFirstGrant && !m_initialCreditRequestSent;
+}
+
+// 标记首轮信用请求已发送，避免重复请求。
+void HomaOutboundMsg::MarkInitialCreditRequestSent (void)
+{
+  m_initialCreditRequestSent = true;
+}
+
+// 构造零负载 DATA 分组，请求接收端显式发放第一笔授权。
+Ptr<Packet> HomaOutboundMsg::GenerateInitialCreditRequest (uint16_t txMsgId)
+{
+  HomaHeader homaHeader;
+  homaHeader.SetDstPort (m_dport);
+  homaHeader.SetSrcPort (m_sport);
+  homaHeader.SetTxMsgId (txMsgId);
+  homaHeader.SetFlags (HomaHeader::Flags_t::DATA);
+  homaHeader.SetMsgSize (m_msgSizeBytes);
+  homaHeader.SetPktOffset (0);
+  homaHeader.SetGrantOffset (0);
+  homaHeader.SetPayloadSize (0);
+  homaHeader.SetFeedbackFlags (HomaHeader::FeedbackFlags_t::FEEDBACK_NONE);
+  homaHeader.SetPrio (0);
+
+  Ptr<Packet> p = Create<Packet> ();
+  SocketIpTosTag ipTosTag;
+  // Keep priority in DSCP bits, ECN in low bits.
+  ipTosTag.SetTos (static_cast<uint8_t> ((0u << 2) | static_cast<uint8_t> (Ipv4Header::ECN_ECT0)));
+  p->ReplacePacketTag (ipTosTag);
+  p->AddHeader (homaHeader);
+  return p;
+}
     
+// 弹出并返回指定偏移的数据分片，同时清理重复排队项避免冗余发送。
 Ptr<Packet> HomaOutboundMsg::RemoveNextPktFromTxQ (uint16_t pktOffset)
 {
   NS_LOG_FUNCTION (this << pktOffset);
@@ -785,6 +1280,29 @@ Ptr<Packet> HomaOutboundMsg::RemoveNextPktFromTxQ (uint16_t pktOffset)
   else
     return m_packets[pktOffset]->Copy();
 }
+
+uint16_t
+HomaOutboundMsg::GetAccumulatedCreditPkts (void) const
+{
+  if (m_waitForFirstGrant || m_pktTxQ.empty ())
+    {
+      return 0;
+    }
+
+  uint16_t nextPktOffset = m_pktTxQ.top ();
+  uint16_t msgSizePkts = m_msgSizeBytes / m_maxPayloadSize + (m_msgSizeBytes % m_maxPayloadSize != 0);
+  if (msgSizePkts == 0)
+    {
+      return 0;
+    }
+
+  uint16_t highestGranted = std::min<uint16_t> (m_maxGrantedIdx, static_cast<uint16_t> (msgSizePkts - 1));
+  if (nextPktOffset > highestGranted)
+    {
+      return 0;
+    }
+  return highestGranted - nextPktOffset + 1;
+}
     
 /*
  * This method updates the state for the corresponding outbound message
@@ -793,6 +1311,7 @@ Ptr<Packet> HomaOutboundMsg::RemoveNextPktFromTxQ (uint16_t pktOffset)
  * so far. This allows reordered Grants to be ignored when more recent 
  * ones are received.
  */
+// 处理 GRANT/RESEND 携带的授权上界与优先级更新，并刷新剩余字节估计。
 void HomaOutboundMsg::HandleGrantOffset (HomaHeader const &homaHeader)
 {
   NS_LOG_FUNCTION (this << homaHeader);
@@ -801,6 +1320,12 @@ void HomaOutboundMsg::HandleGrantOffset (HomaHeader const &homaHeader)
   NS_ASSERT_MSG(grantOffset < this->GetMsgSizePkts (), 
                 "HomaOutboundMsg shouldn't be granted after it is already fully granted!");
   
+  bool firstGrant = m_waitForFirstGrant && grantOffset >= m_maxGrantedIdx;
+  if (m_waitForFirstGrant && grantOffset >= m_maxGrantedIdx)
+  {
+    m_waitForFirstGrant = false;
+  }
+
   if (grantOffset > m_maxGrantedIdx)
   {
     NS_LOG_LOGIC("HomaOutboundMsg (" << this 
@@ -820,8 +1345,16 @@ void HomaOutboundMsg::HandleGrantOffset (HomaHeader const &homaHeader)
      * one way to estimate the remaining bytes is to exploit the mechanism where
      * Homa grants messages in a way that there is always exactly 1 BDP worth of 
      * packets on flight. Then we can calculate the remaining bytes as the following.
-     */
+    */
     m_remainingBytes = m_msgSizeBytes - (m_maxGrantedIdx+1 - m_homa->GetBdp ()) * m_maxPayloadSize;
+  }
+  else if (firstGrant)
+  {
+    uint8_t prio = homaHeader.GetPrio();
+    NS_LOG_LOGIC("HomaOutboundMsg (" << this << ") is setting priority to "
+                 << (uint16_t) prio << " for the first Grant.");
+    m_prio = prio;
+    m_prioSetByReceiver = true;
   }
   else
   {
@@ -830,6 +1363,7 @@ void HomaOutboundMsg::HandleGrantOffset (HomaHeader const &homaHeader)
   }
 }
     
+// 处理 RESEND 请求：将缺失分片重新入队，并在必要时提升授权上界。
 void HomaOutboundMsg::HandleResend (HomaHeader const &homaHeader)
 {
   NS_LOG_FUNCTION (this << homaHeader);
@@ -858,6 +1392,7 @@ void HomaOutboundMsg::HandleResend (HomaHeader const &homaHeader)
   }
 }
     
+// 处理 ACK：校验完整确认号后将消息剩余字节置零。
 void HomaOutboundMsg::HandleAck (HomaHeader const &homaHeader)
 {
   NS_LOG_FUNCTION (this << homaHeader);
@@ -868,6 +1403,7 @@ void HomaOutboundMsg::HandleAck (HomaHeader const &homaHeader)
   m_remainingBytes = 0;
 }
     
+// 构造 BUSY 控制包，告知对端当前发送端暂不可立即服务该消息。
 Ptr<Packet> HomaOutboundMsg::GenerateBusy (uint16_t targetTxMsgId)
 {
   NS_LOG_FUNCTION (this << targetTxMsgId);
@@ -900,6 +1436,7 @@ Ptr<Packet> HomaOutboundMsg::GenerateBusy (uint16_t targetTxMsgId)
   return busyPacket;
 }
     
+// 发送侧超时处理：若长时间无授权进展则将消息标记为过期。
 void HomaOutboundMsg::ExpireRtxTimeout(uint16_t lastRtxGrntIdx)
 {
   NS_LOG_FUNCTION(this << lastRtxGrntIdx);
@@ -925,8 +1462,9 @@ void HomaOutboundMsg::ExpireRtxTimeout(uint16_t lastRtxGrntIdx)
     
 /******************************************************************************/
     
-const uint16_t HomaSendScheduler::MAX_N_MSG = 255;
+const uint16_t HomaSendScheduler::MAX_N_MSG = 2560;
 
+// 注册并返回 HomaSendScheduler 的 TypeId。
 TypeId HomaSendScheduler::GetTypeId (void)
 {
   static TypeId tid = TypeId ("ns3::HomaSendScheduler")
@@ -936,6 +1474,7 @@ TypeId HomaSendScheduler::GetTypeId (void)
   return tid;
 }
     
+// 构造发送调度器并初始化可分配 txMsgId 自由列表。
 HomaSendScheduler::HomaSendScheduler (Ptr<HomaL4Protocol> homaL4Protocol)
 {
   NS_LOG_FUNCTION (this);
@@ -947,6 +1486,7 @@ HomaSendScheduler::HomaSendScheduler (Ptr<HomaL4Protocol> homaL4Protocol)
   std::iota(m_txMsgIdFreeList.begin(), m_txMsgIdFreeList.end(), 0);
 }
 
+// 析构时检查是否仍有未完成消息，便于发现发送流程异常。
 HomaSendScheduler::~HomaSendScheduler ()
 {
   NS_LOG_FUNCTION_NOARGS ();
@@ -965,6 +1505,7 @@ HomaSendScheduler::~HomaSendScheduler ()
  * It inserts the message into the list of pending outbound messages and updates
  * the scheduler's state accordingly.
  */
+// 接收新消息并分配 txMsgId；若发送器空闲则安排首次发送事件。
 int HomaSendScheduler::ScheduleNewMsg (Ptr<HomaOutboundMsg> outMsg)
 {
   NS_LOG_FUNCTION (this << outMsg);
@@ -1006,6 +1547,7 @@ int HomaSendScheduler::ScheduleNewMsg (Ptr<HomaOutboundMsg> outMsg)
  * See the nested if statements for the algorithm to choose 
  * highest priority outbound message.
  */
+// 在所有活跃消息中选择下一条最应优先发送的消息，并清理已过期状态。
 bool HomaSendScheduler::GetNextMsgId (uint16_t &txMsgId)
 {
   NS_LOG_FUNCTION (this);
@@ -1031,8 +1573,10 @@ bool HomaSendScheduler::GetNextMsgId (uint16_t &txMsgId)
       // Accept current msg if the remainig size is smaller than minRemainingBytes
       if (curRemainingBytes < minRemainingBytes)
       {
-        // Accept current msg if it has a granted but not transmitted packet
-        if (currentMsg->GetNextPktOffset(pktOffset))
+        // Accept current msg if it has a sendable data packet or needs a
+        // zero-payload initial credit request for long SIRD messages.
+        if (currentMsg->NeedsInitialCreditRequest () ||
+            currentMsg->GetNextPktOffset(pktOffset))
         {
           candidateMsg = currentMsg;
           txMsgId = it.first;
@@ -1061,13 +1605,22 @@ bool HomaSendScheduler::GetNextMsgId (uint16_t &txMsgId)
   return msgSelected;
 }
     
+// 为指定消息构造下一待发分组（可能是信用请求或真实 DATA）。
 bool HomaSendScheduler::GetNextPktOfMsg (uint16_t txMsgId, Ptr<Packet> &p)
 {
   NS_LOG_FUNCTION (this << txMsgId);
-  
+    
   uint16_t pktOffset;
   Ptr<HomaOutboundMsg> candidateMsg = m_outboundMsgs[txMsgId];
+
+  if (candidateMsg->NeedsInitialCreditRequest ())
+  {
+    p = candidateMsg->GenerateInitialCreditRequest (txMsgId);
+    candidateMsg->MarkInitialCreditRequestSent ();
+    return true;
+  }
     
+  uint32_t accumulatedCreditPkts = this->GetAccumulatedCreditPkts ();
   if (candidateMsg->GetNextPktOffset(pktOffset))
   {
     p = candidateMsg->RemoveNextPktFromTxQ(pktOffset);
@@ -1081,13 +1634,24 @@ bool HomaSendScheduler::GetNextPktOfMsg (uint16_t txMsgId, Ptr<Packet> &p)
     homaHeader.SetPktOffset (pktOffset);
     homaHeader.SetGrantOffset (candidateMsg->GetMaxGrantedIdx ()); // For monitoring purposes
     homaHeader.SetPayloadSize (p->GetSize ());
+    if (m_homa->IsSirdEnabled () && accumulatedCreditPkts > m_homa->GetSirdSenderCsnThreshold ())
+    {
+      homaHeader.SetFeedbackFlags (HomaHeader::FeedbackFlags_t::FEEDBACK_CSN);
+    }
+    else
+    {
+      homaHeader.SetFeedbackFlags (HomaHeader::FeedbackFlags_t::FEEDBACK_NONE);
+    }
     
     // NOTE: Use the following SocketIpTosTag append strategy when 
     //       sending packets out. This allows us to set the priority
     //       of the packets correctly for the PfifoHomaQueueDisc way of 
     //       priority queueing in the network.
     SocketIpTosTag ipTosTag;
-    ipTosTag.SetTos (candidateMsg->GetPrio (pktOffset)); 
+    uint8_t dataPrio = candidateMsg->GetPrio (pktOffset);
+    uint8_t ecn = m_homa->IsSirdEnabled () ? static_cast<uint8_t> (Ipv4Header::ECN_ECT0)
+                         : static_cast<uint8_t> (Ipv4Header::ECN_NotECT);
+    ipTosTag.SetTos (static_cast<uint8_t> ((dataPrio << 2) | ecn));
     // This packet may already have a SocketIpTosTag (see HomaSocket)
     p->ReplacePacketTag (ipTosTag);
       
@@ -1113,6 +1677,17 @@ bool HomaSendScheduler::GetNextPktOfMsg (uint16_t txMsgId, Ptr<Packet> &p)
     return false;
   }
 }
+
+uint32_t
+HomaSendScheduler::GetAccumulatedCreditPkts (void) const
+{
+  uint32_t accumulatedCreditPkts = 0;
+  for (const auto& kv : m_outboundMsgs)
+    {
+      accumulatedCreditPkts += kv.second->GetAccumulatedCreditPkts ();
+    }
+  return accumulatedCreditPkts;
+}
  
 /*
  * This method is called either when a new packet to send is found after
@@ -1121,6 +1696,7 @@ bool HomaSendScheduler::GetNextPktOfMsg (uint16_t txMsgId, Ptr<Packet> &p)
  * priority packet just before sending it.
  */
 void
+// 发送调度主循环：按链路空闲时刻触发，选包并下发后继续自调度。
 HomaSendScheduler::TxDataPacket ()
 {
   NS_LOG_FUNCTION (this);
@@ -1162,6 +1738,7 @@ HomaSendScheduler::TxDataPacket ()
  * This method is called when a control packet is received that interests
  * an outbound message.
  */
+// 处理发送侧关注的控制包（GRANT/RESEND/ACK），并驱动状态机前进。
 void HomaSendScheduler::CtrlPktRecvdForOutboundMsg(Ipv4Header const &ipv4Header, 
                                                    HomaHeader const &homaHeader)
 {
@@ -1245,17 +1822,27 @@ void HomaSendScheduler::CtrlPktRecvdForOutboundMsg(Ipv4Header const &ipv4Header,
                                      &HomaSendScheduler::TxDataPacket, this);
 }
     
+// 清理完成或失效消息的发送状态，回收 txMsgId。
 void HomaSendScheduler::ClearStateForMsg (uint16_t txMsgId)
 {
   NS_LOG_FUNCTION(this << txMsgId);
-  
-  Simulator::Cancel (m_outboundMsgs[txMsgId]->GetRtxEvent ());
+
+  Ptr<HomaOutboundMsg> outMsg = m_outboundMsgs[txMsgId];
+  std::string key = MakePathRttKey (outMsg->GetSrcAddress (),
+                                    outMsg->GetDstAddress (),
+                                    outMsg->GetSrcPort (),
+                                    outMsg->GetDstPort (),
+                                    txMsgId);
+  g_pathRttFlowStates.erase (key);
+
+  Simulator::Cancel (outMsg->GetRtxEvent ());
   m_outboundMsgs.erase(m_outboundMsgs.find(txMsgId));
   m_txMsgIdFreeList.push_back(txMsgId);
 }
     
 /******************************************************************************/
 
+// 注册并返回 HomaInboundMsg 的 TypeId。
 TypeId HomaInboundMsg::GetTypeId (void)
 {
   static TypeId tid = TypeId ("ns3::HomaInboundMsg")
@@ -1268,11 +1855,14 @@ TypeId HomaInboundMsg::GetTypeId (void)
 /*
  * This method creates a new inbound message with the given information.
  */
+// 构造接收侧消息状态：初始化分片缓冲、授权窗口和重传相关计数。
 HomaInboundMsg::HomaInboundMsg (Ptr<Packet> p,
                                 Ipv4Header const &ipv4Header, HomaHeader const &homaHeader, 
                                 Ptr<Ipv4Interface> iface, uint32_t mtuBytes, 
-                                uint16_t rttPackets, bool memIsOptimized)
+                                uint16_t rttPackets, bool memIsOptimized,
+                                bool sirdEnabled, uint16_t sirdUnschThresholdPkts)
     : m_prio(0),
+      m_hasGrantedData(false),
       m_currentlyScheduled(false),
       m_numRtxWithoutProgress (0)
 {
@@ -1289,8 +1879,8 @@ HomaInboundMsg::HomaInboundMsg (Ptr<Packet> p,
   uint32_t maxPayloadSize = mtuBytes - homaHeader.GetSerializedSize () - ipv4Header.GetSerializedSize ();
   m_msgSizePkts = m_msgSizeBytes / maxPayloadSize + (m_msgSizeBytes % maxPayloadSize != 0);
           
-  // The remaining undelivered message size equals to the total message size in the beginning
-  m_remainingBytes = m_msgSizeBytes - p->GetSize();
+  // The remaining undelivered message size equals to total minus actually received payload.
+  m_remainingBytes = m_msgSizeBytes;
   
   // Fill in the packet buffer with place holder (empty) packets and set the received info as false
   for (uint16_t i = 0; i < m_msgSizePkts; i++)
@@ -1304,57 +1894,82 @@ HomaInboundMsg::HomaInboundMsg (Ptr<Packet> p,
   } 
           
   uint16_t pktOffset = homaHeader.GetPktOffset ();
-  if (memIsOptimized)
-    m_pktSizes[pktOffset] = p->GetSize ();
+  bool hasPayload = p->GetSize () > 0;
+  if (hasPayload)
+  {
+    if (memIsOptimized)
+      m_pktSizes[pktOffset] = p->GetSize ();
+    else
+      m_packets[pktOffset] = p;
+    m_receivedPackets[pktOffset] = true;
+    m_remainingBytes -= p->GetSize ();
+  }
+
+  bool longSirdMsg = sirdEnabled && m_msgSizePkts > std::max<uint16_t> (1, sirdUnschThresholdPkts);
+  if (longSirdMsg)
+  {
+    m_maxGrantedIdx = 0;
+    m_maxGrantableIdx = 0;
+    m_hasGrantedData = false;
+  }
   else
-    m_packets[pktOffset] = p;
-  m_receivedPackets[pktOffset] = true;
-          
-  m_maxGrantedIdx = std::min((uint16_t)(rttPackets-1), m_msgSizePkts); // Unscheduled pkts are already granted
-  m_maxGrantableIdx = m_maxGrantedIdx + 1; // 1 Data pkt is already received
+  {
+    m_maxGrantedIdx = std::min<uint16_t> (rttPackets - 1, m_msgSizePkts - 1); // Unscheduled pkts are already granted
+    m_maxGrantableIdx = m_maxGrantedIdx + 1; // 1 Data pkt is already received
+    m_hasGrantedData = true;
+  }
   m_lastRtxGrntIdx = m_maxGrantableIdx;
 }
 
+// 析构函数：当前无额外资源回收逻辑。
 HomaInboundMsg::~HomaInboundMsg ()
 {
   NS_LOG_FUNCTION_NOARGS ();
 }
     
+// 读取并返回当前对象中的配置或运行时状态值（只读访问，不修改内部状态）。
 uint32_t HomaInboundMsg::GetRemainingBytes()
 {
   return m_remainingBytes;
 }
     
+// 读取并返回当前对象中的配置或运行时状态值（只读访问，不修改内部状态）。
 Ipv4Address HomaInboundMsg::GetSrcAddress ()
 {
   return m_ipv4Header.GetSource ();
 }
     
+// 读取并返回当前对象中的配置或运行时状态值（只读访问，不修改内部状态）。
 Ipv4Address HomaInboundMsg::GetDstAddress ()
 {
   return m_ipv4Header.GetDestination ();
 }
 
+// 读取并返回当前对象中的配置或运行时状态值（只读访问，不修改内部状态）。
 uint16_t HomaInboundMsg::GetSrcPort ()
 {
   return m_sport;
 }
     
+// 读取并返回当前对象中的配置或运行时状态值（只读访问，不修改内部状态）。
 uint16_t HomaInboundMsg::GetDstPort ()
 {
   return m_dport;
 }
     
+// 读取并返回当前对象中的配置或运行时状态值（只读访问，不修改内部状态）。
 uint16_t HomaInboundMsg::GetTxMsgId ()
 {
   return m_txMsgId;
 }
     
+// 读取并返回当前对象中的配置或运行时状态值（只读访问，不修改内部状态）。
 Ipv4Header HomaInboundMsg::GetIpv4Header ()
 {
   return m_ipv4Header;
 }
     
+// 读取并返回当前对象中的配置或运行时状态值（只读访问，不修改内部状态）。
 Ptr<Ipv4Interface> HomaInboundMsg::GetIpv4Interface ()
 {
   return m_iface;
@@ -1365,68 +1980,125 @@ Ptr<Ipv4Interface> HomaInboundMsg::GetIpv4Interface ()
  * the corresponding EventId of messages are kept within the messages 
  * themselves for the sake of being tidy.
  */
+// 把重传定时器事件句柄挂在消息对象上，便于调度器统一管理。
 void HomaInboundMsg::SetRtxEvent (EventId rtxEvent)
 {
   m_rtxEvent = rtxEvent;
 }
+// 读取并返回当前对象中的配置或运行时状态值（只读访问，不修改内部状态）。
 EventId HomaInboundMsg::GetRtxEvent ()
 {
   return m_rtxEvent;
 }
 
+// 读取并返回当前对象中的配置或运行时状态值（只读访问，不修改内部状态）。
 uint16_t HomaInboundMsg::GetMaxGrantableIdx ()
 {
   return m_maxGrantableIdx;
 }
+
+// 限制本轮最多可继续授权的窗口大小，用于精确控制 SIRD 授权额度。
+void HomaInboundMsg::CapGrantableWindow (uint16_t grantWindowPkts)
+{
+  if (m_msgSizePkts == 0)
+  {
+    return;
+  }
+
+  uint16_t cappedWindow = std::max<uint16_t> (1, grantWindowPkts);
+  uint32_t baseGrantable = m_hasGrantedData ? m_maxGrantedIdx + cappedWindow : cappedWindow - 1;
+  uint32_t cappedMaxGrantable = std::min<uint32_t> (m_msgSizePkts - 1, baseGrantable);
+  m_maxGrantableIdx = std::min<uint16_t> (m_maxGrantableIdx, static_cast<uint16_t> (cappedMaxGrantable));
+}
+
+bool HomaInboundMsg::AdvanceGrantableWindow (uint16_t grantPkts)
+{
+  if (m_msgSizePkts == 0 || this->IsFullyGranted ())
+  {
+    return false;
+  }
+
+  uint16_t creditPkts = std::max<uint16_t> (1, grantPkts);
+  uint32_t baseGrantable = m_hasGrantedData ? m_maxGrantedIdx + creditPkts : creditPkts - 1;
+  uint32_t advancedMaxGrantable = std::min<uint32_t> (m_msgSizePkts - 1, baseGrantable);
+  if (advancedMaxGrantable <= m_maxGrantableIdx)
+  {
+    return false;
+  }
+
+  m_maxGrantableIdx = static_cast<uint16_t> (advancedMaxGrantable);
+  return true;
+}
+
+// 读取并返回当前对象中的配置或运行时状态值（只读访问，不修改内部状态）。
 uint16_t HomaInboundMsg::GetMaxGrantedIdx ()
 {
   return m_maxGrantedIdx;
 }
  
+// 写入并更新当前对象的配置或运行时状态，为后续流程提供输入。
 void HomaInboundMsg::SetLastRtxGrntIdx (uint16_t lastRtxGrntIdx)
 {
   m_lastRtxGrntIdx = lastRtxGrntIdx;
 }
+// 读取并返回当前对象中的配置或运行时状态值（只读访问，不修改内部状态）。
 uint16_t HomaInboundMsg::GetLastRtxGrntIdx ()
 {
   return m_lastRtxGrntIdx;
 }
     
+// 判断该消息是否已经被授权到最后一个分片。
 bool HomaInboundMsg::IsFullyGranted ()
 {
+  if (!m_hasGrantedData)
+  {
+    return false;
+  }
   return m_maxGrantedIdx >= m_msgSizePkts-1;
 }
 
+// 判断当前是否还能继续发送 GRANT（已授权上界尚未追上可授权上界）。
 bool HomaInboundMsg::IsGrantable ()
 {
+  if (!m_hasGrantedData)
+  {
+    return m_msgSizePkts > 0 && m_maxGrantableIdx < m_msgSizePkts;
+  }
   return m_maxGrantedIdx < m_maxGrantableIdx;
 }
     
+// 判断消息所有分片是否都已收到。
 bool HomaInboundMsg::IsFullyReceived ()
 {
+  // 该函数实现当前类的一个核心步骤，结合调用链可理解其在状态机中的角色。
   return std::none_of(m_receivedPackets.begin(), 
                       m_receivedPackets.end(), 
                       std::logical_not<bool>());
 }
 
+// 根据当前状态进行条件判断，返回布尔决策供上层流程分支使用。
 bool HomaInboundMsg::IsCurrentlyScheduled (void) 
 {
   return m_currentlyScheduled;
 }
 
+// 写入并更新当前对象的配置或运行时状态，为后续流程提供输入。
 void HomaInboundMsg::SetCurrentlyScheduled (bool currentlyScheduled) 
 {
   m_currentlyScheduled = currentlyScheduled;
 }
     
+// 读取并返回当前对象中的配置或运行时状态值（只读访问，不修改内部状态）。
 uint16_t HomaInboundMsg::GetNumRtxWithoutProgress ()
 {
   return m_numRtxWithoutProgress;
 }
+// 该函数实现当前类的一个核心步骤，结合调用链可理解其在状态机中的角色。
 void HomaInboundMsg::IncrNumRtxWithoutProgress ()
 {
   m_numRtxWithoutProgress++;
 }
+// 该函数实现当前类的一个核心步骤，结合调用链可理解其在状态机中的角色。
 void HomaInboundMsg::ResetNumRtxWithoutProgress ()
 {
   m_numRtxWithoutProgress = 0;
@@ -1435,9 +2107,16 @@ void HomaInboundMsg::ResetNumRtxWithoutProgress ()
 /*
  * This method updates the state for an inbound message upon receival of a data packet.
  */
+// 接收并登记一个数据分片，推进可授权窗口，并更新剩余字节。
 void HomaInboundMsg::ReceiveDataPacket (Ptr<Packet> p, uint16_t pktOffset)
 {
   NS_LOG_FUNCTION (this << p << pktOffset);
+
+  if (p->GetSize () == 0)
+  {
+    // Zero-payload DATA is a credit request for long scheduled messages.
+    return;
+  }
     
   if (!m_receivedPackets[pktOffset])
   {
@@ -1454,7 +2133,10 @@ void HomaInboundMsg::ReceiveDataPacket (Ptr<Packet> p, uint16_t pktOffset)
      * is upto the HomaRecvScheduler to decide whether to send a Grant packet 
      * to the sender of this message or not.
      */
-    m_maxGrantableIdx++;
+    if (m_maxGrantableIdx < m_msgSizePkts - 1)
+    {
+      m_maxGrantableIdx++;
+    }
   }
   else
   {
@@ -1465,6 +2147,7 @@ void HomaInboundMsg::ReceiveDataPacket (Ptr<Packet> p, uint16_t pktOffset)
   }
 }
     
+// 在消息完整后执行重组，返回可直接上交应用层的完整 Packet。
 Ptr<Packet> HomaInboundMsg::GetReassembledMsg ()
 {
   NS_LOG_FUNCTION (this);
@@ -1495,14 +2178,17 @@ Ptr<Packet> HomaInboundMsg::GetReassembledMsg ()
   }
 }
     
+// 根据当前接收进度生成 GRANT 或 ACK 控制包，并同步授权边界。
 Ptr<Packet> HomaInboundMsg::GenerateGrantOrAck(uint8_t grantedPrio,
                                                uint8_t pktTypeFlag)
 {
   NS_LOG_FUNCTION (this << grantedPrio);
-  NS_ASSERT(this->IsGrantable());
   NS_ASSERT_MSG((pktTypeFlag & HomaHeader::Flags_t::GRANT) || 
                 (pktTypeFlag & HomaHeader::Flags_t::ACK),
                 "GenerateGrantOrAck() can only be called to generate GRANT or ACK packets!");
+  bool isAck = (pktTypeFlag & HomaHeader::Flags_t::ACK) != 0;
+  NS_ASSERT_MSG(isAck || this->IsGrantable(),
+                "GenerateGrantOrAck() can only generate GRANT for a grantable message!");
     
   m_prio = grantedPrio; // Updated with the most recent granted priority value
     
@@ -1523,7 +2209,8 @@ Ptr<Packet> HomaInboundMsg::GenerateGrantOrAck(uint8_t grantedPrio,
   homaHeader.SetTxMsgId (m_txMsgId);
   homaHeader.SetMsgSize (m_msgSizeBytes);
   homaHeader.SetPktOffset (ackNo);
-  homaHeader.SetGrantOffset (m_maxGrantableIdx);
+  uint16_t grantOffset = m_msgSizePkts == 0 ? 0 : std::min<uint16_t> (m_maxGrantableIdx, m_msgSizePkts - 1);
+  homaHeader.SetGrantOffset (grantOffset);
   homaHeader.SetPrio (m_prio);
   homaHeader.SetPayloadSize (0);
   homaHeader.SetFlags (pktTypeFlag);
@@ -1536,11 +2223,16 @@ Ptr<Packet> HomaInboundMsg::GenerateGrantOrAck(uint8_t grantedPrio,
   // This packet may already have a SocketIpTosTag (see HomaSocket)
   p->ReplacePacketTag (ipTosTag);
     
-  m_maxGrantedIdx = m_maxGrantableIdx;
+  if (!isAck)
+  {
+    m_maxGrantedIdx = grantOffset;
+    m_hasGrantedData = true;
+  }
     
   return p;
 }
     
+// 扫描缺失分片并批量生成 RESEND 控制包列表。
 std::list<Ptr<Packet>> HomaInboundMsg::GenerateResends (uint16_t maxRsndPktOffset)
 {
   NS_LOG_FUNCTION (this << maxRsndPktOffset);
@@ -1548,6 +2240,10 @@ std::list<Ptr<Packet>> HomaInboundMsg::GenerateResends (uint16_t maxRsndPktOffse
   std::list<Ptr<Packet>> rsndPkts;
     
   maxRsndPktOffset = std::min(maxRsndPktOffset, m_msgSizePkts);
+  if (!m_hasGrantedData)
+  {
+    return rsndPkts;
+  }
   maxRsndPktOffset = std::min(maxRsndPktOffset, m_maxGrantedIdx);
   for (uint16_t i = 0; i < maxRsndPktOffset; ++i)
   {
@@ -1582,6 +2278,7 @@ std::list<Ptr<Packet>> HomaInboundMsg::GenerateResends (uint16_t maxRsndPktOffse
     
 /******************************************************************************/
 
+// 注册并返回 HomaRecvScheduler 的 TypeId。
 TypeId HomaRecvScheduler::GetTypeId (void)
 {
   static TypeId tid = TypeId ("ns3::HomaRecvScheduler")
@@ -1591,13 +2288,20 @@ TypeId HomaRecvScheduler::GetTypeId (void)
   return tid;
 }
     
+// 构造接收调度器并初始化 SIRD 相关全局/每发送方统计状态。
 HomaRecvScheduler::HomaRecvScheduler (Ptr<HomaL4Protocol> homaL4Protocol)
 {
   NS_LOG_FUNCTION (this);
       
   m_homa = homaL4Protocol;
+  m_sirdGlobalCreditsInUsePkts = 0;
+  m_sirdCeRatioEwma = 0.0;
+  m_sirdDataPktsObserved = 0;
+  m_sirdCeMarksObserved = 0;
+  m_creditTickEvent = EventId ();
 }
 
+// 析构时检查是否仍有未完成入站消息，辅助排查接收流程问题。
 HomaRecvScheduler::~HomaRecvScheduler ()
 {
   NS_LOG_FUNCTION_NOARGS ();
@@ -1611,6 +2315,7 @@ HomaRecvScheduler::~HomaRecvScheduler ()
   }
 }
     
+// 接收侧入口：处理 DATA/BUSY，并在每次到包后重新评估是否应发放授权。
 void HomaRecvScheduler::ReceivePacket (Ptr<Packet> packet, 
                                        Ipv4Header const &ipv4Header,
                                        HomaHeader const &homaHeader,
@@ -1618,9 +2323,56 @@ void HomaRecvScheduler::ReceivePacket (Ptr<Packet> packet,
 {
   NS_LOG_FUNCTION (this << packet << ipv4Header << homaHeader);
     
-  uint8_t rxFlag = homaHeader.GetFlags ();
+  uint8_t rxFlag = homaHeader.GetFlags ();//是 Data 还是 busy
   if (rxFlag & HomaHeader::Flags_t::DATA )
   {
+    if (m_homa->IsSirdEnabled ())
+    {
+      const uint32_t senderKey = ipv4Header.GetSource ().Get ();//用 sender 的 ip 做 key
+      m_sirdSenderCsnState[senderKey] = (homaHeader.GetFeedbackFlags () & HomaHeader::FeedbackFlags_t::FEEDBACK_CSN) != 0;//从 Homa 头里的 feedbackFlags 读取 CSN 位，并更新这个 sender 最近一次的 CSN 状态
+      bool ceMarked = ipv4Header.GetEcn () == Ipv4Header::ECN_CE;
+      m_sirdSenderCeState[senderKey] = ceMarked;
+
+      m_sirdDataPktsObserved++;//用于统计或平滑估计
+      if (ceMarked)
+      {
+        m_sirdCeMarksObserved++;
+      }
+      double sampleCeRatio = ceMarked ? 1.0 : 0.0;
+      double alpha = m_homa->GetSirdEcnAlphaGain ();
+      m_sirdCeRatioEwma = (1.0 - alpha) * m_sirdCeRatioEwma + alpha * sampleCeRatio;
+
+      // Reclaim outstanding scheduled credits as data arrives.
+      if (packet->GetSize () > 0)//是 Data 包，负载大于 0
+      {
+        auto inUseIt = m_sirdSenderCreditsInUsePkts.find (senderKey);
+        if (inUseIt != m_sirdSenderCreditsInUsePkts.end () && inUseIt->second > 0)
+        {
+          inUseIt->second--;
+          if (m_sirdGlobalCreditsInUsePkts > 0)
+          {
+            m_sirdGlobalCreditsInUsePkts--;
+          }
+
+          double senderBudgetHostPkts = static_cast<double> (std::max<uint16_t> (1, m_homa->GetBdp ()));
+          auto senderBudgetIt = m_sirdSenderBudgetHostPkts.find (senderKey);
+          if (senderBudgetIt != m_sirdSenderBudgetHostPkts.end ())
+          {
+            senderBudgetHostPkts = senderBudgetIt->second;
+          }
+
+          const uint32_t globalBudgetPkts = std::max<uint32_t> (1, m_homa->GetSirdCreditBudgetPkts ());
+          m_homa->TraceSirdBucketState (ipv4Header.GetDestination (),
+                                        Ipv4Address (senderKey),
+                                        senderBudgetHostPkts,
+                                        inUseIt->second,
+                                        m_sirdGlobalCreditsInUsePkts,
+                                        globalBudgetPkts,
+                                        2);
+        }
+      }//credit 归还
+    }
+
     this->ReceiveDataPacket (packet, ipv4Header, homaHeader, interface);
     // Sender is not busy since it is able to send data packets
     m_busySenders.erase(ipv4Header.GetSource().Get ());
@@ -1630,10 +2382,33 @@ void HomaRecvScheduler::ReceivePacket (Ptr<Packet> packet,
     m_busySenders.insert(ipv4Header.GetSource().Get ());
     // TODO: Is there anything else to do with a BUSY packet?
   }
-    
-  this->SendAppropriateGrants();
+
+  const uint32_t senderKey = ipv4Header.GetSource ().Get ();
+  uint32_t senderCreditsInUsePkts = 0;
+  auto senderInUseIt = m_sirdSenderCreditsInUsePkts.find (senderKey);
+  if (senderInUseIt != m_sirdSenderCreditsInUsePkts.end ())
+  {
+    senderCreditsInUsePkts = senderInUseIt->second;
+  }
+  uint8_t ecn = static_cast<uint8_t> (ipv4Header.GetEcn ());
+  bool csn = (homaHeader.GetFeedbackFlags () & HomaHeader::FeedbackFlags_t::FEEDBACK_CSN) != 0;
+  uint32_t senderCreditClamped = std::min<uint32_t> (senderCreditsInUsePkts, 0xFFFFu);
+  uint32_t globalCreditClamped = std::min<uint32_t> (m_sirdGlobalCreditsInUsePkts, 0xFFFFu);
+  uint32_t creditState = (globalCreditClamped << 16) | senderCreditClamped;
+  m_homa->TraceSirdPacketState (ipv4Header.GetDestination (),
+                                ipv4Header.GetSource (),
+                                homaHeader.GetFlags (),
+                                (static_cast<uint32_t> (homaHeader.GetTxMsgId ()) << 16) |
+                                  static_cast<uint32_t> (homaHeader.GetPktOffset ()),
+                                homaHeader.GetGrantOffset (),
+                                ecn,
+                                csn,
+                                creditState);
+
+  this->EnsureCreditTickScheduled (true);
 }
     
+// 把 DATA 分组归并到对应消息；若消息完成则上交，否则重排调度队列。
 void HomaRecvScheduler::ReceiveDataPacket (Ptr<Packet> packet, 
                                            Ipv4Header const &ipv4Header,
                                            HomaHeader const &homaHeader,
@@ -1655,7 +2430,8 @@ void HomaRecvScheduler::ReceiveDataPacket (Ptr<Packet> packet,
   {
     inboundMsg = CreateObject<HomaInboundMsg> (cp, ipv4Header, homaHeader, interface, 
                                                m_homa->GetMtu (), m_homa->GetBdp (), 
-                                               m_homa->MemIsOptimized ());
+                                               m_homa->MemIsOptimized (), m_homa->IsSirdEnabled (),
+                                               m_homa->GetSirdUnschThresholdPkts ());
     inboundMsg-> SetRtxEvent (Simulator::Schedule (m_homa->GetInboundRtxTimeout(), 
                                                    &HomaRecvScheduler::ExpireRtxTimeout, this, 
                                                    inboundMsg, inboundMsg->GetMaxGrantedIdx ()));
@@ -1673,6 +2449,7 @@ void HomaRecvScheduler::ReceiveDataPacket (Ptr<Packet> packet,
   }
 }
     
+// 按五元组+txMsgId 在活跃入站消息列表中查找目标消息。
 bool HomaRecvScheduler::GetInboundMsg(Ipv4Header const &ipv4Header, 
                                       HomaHeader const &homaHeader,
                                       int &msgIdx)
@@ -1698,6 +2475,7 @@ bool HomaRecvScheduler::GetInboundMsg(Ipv4Header const &ipv4Header,
   return false;
 }
     
+// 将消息按策略（SRPT 或 SRR）插回活跃队列，维护接收调度顺序。
 void HomaRecvScheduler::ScheduleMsgAtIdx(Ptr<HomaInboundMsg> inboundMsg,
                                          int msgIdx)
 {
@@ -1718,6 +2496,13 @@ void HomaRecvScheduler::ScheduleMsgAtIdx(Ptr<HomaInboundMsg> inboundMsg,
     
     m_inboundMsgs.erase(m_inboundMsgs.begin() + msgIdx);
   }
+
+  // SRR-like mode: keep messages in FIFO order among active flows.
+  if (m_homa->UseSrrScheduling ())
+  {
+    m_inboundMsgs.push_back (inboundMsg);
+    return;
+  }
   
   for(std::size_t i = 0; i < m_inboundMsgs.size(); ++i) 
   {
@@ -1731,6 +2516,7 @@ void HomaRecvScheduler::ScheduleMsgAtIdx(Ptr<HomaInboundMsg> inboundMsg,
   m_inboundMsgs.push_back(inboundMsg);
 }
     
+// 将完整消息上交 L4，并立即回送 ACK，然后清理该消息状态。
 void HomaRecvScheduler::ForwardUp(Ptr<HomaInboundMsg> inboundMsg, int msgIdx)
 {
   NS_LOG_FUNCTION (this << inboundMsg);
@@ -1750,6 +2536,7 @@ void HomaRecvScheduler::ForwardUp(Ptr<HomaInboundMsg> inboundMsg, int msgIdx)
   this->ClearStateForMsg (inboundMsg, msgIdx);
 }
     
+// 取消定时器并从活跃列表移除入站消息。
 void HomaRecvScheduler::ClearStateForMsg(Ptr<HomaInboundMsg> inboundMsg, int msgIdx)
 {
   NS_LOG_FUNCTION (this << inboundMsg << msgIdx);
@@ -1784,50 +2571,293 @@ void HomaRecvScheduler::ClearStateForMsg(Ptr<HomaInboundMsg> inboundMsg, int msg
  * all the messages, ideally at most one message should be granted because other
  * messages should already be granted when they received packets for themselves.
  */
-void HomaRecvScheduler::SendAppropriateGrants()
+// 根据 overcommit、busy 状态与 SIRD 预算，选择消息并发送合适的 GRANT。
+bool HomaRecvScheduler::SendAppropriateGrants()
 {
   NS_LOG_FUNCTION (this);
+  bool grantIssued = false;
+
+  if (!m_homa->IsSirdEnabled ())
+  {
+    std::unordered_set<uint32_t> grantedSenders; // Same sender can't be granted for multiple msgs at once
+    uint8_t grantingPrio = m_homa->GetNumUnschedPrioBands (); // Scheduled priorities start here
+    uint8_t overcommitDue = m_homa->GetOvercommitLevel ();
+
+    Ptr<HomaInboundMsg> currentMsg;
+    for (std::size_t i = 0; i < m_inboundMsgs.size(); ++i)
+    {
+      currentMsg = m_inboundMsgs[i];
+      currentMsg->SetCurrentlyScheduled(false);
+
+	    if (overcommitDue > 0)
+	      {
+	        grantingPrio = std::min(grantingPrio, (uint8_t)(m_homa->GetNumTotalPrioBands()-1));
+
+
+	        Ipv4Address senderAddress = currentMsg->GetSrcAddress ();
+	        bool issuedThisRound = false;
+	        if (!currentMsg->IsFullyGranted () &&
+	            grantedSenders.find(senderAddress.Get ()) == grantedSenders.end())
+	        {
+	          if (m_busySenders.find(senderAddress.Get ()) == m_busySenders.end())
+	          {
+            if (currentMsg->IsGrantable ())
+            {
+	              m_homa->SendDown(currentMsg->GenerateGrantOrAck(grantingPrio,
+	                                                              HomaHeader::Flags_t::GRANT),
+	                              currentMsg->GetDstAddress (),
+	                              senderAddress);
+	              currentMsg->SetCurrentlyScheduled(true);
+	              issuedThisRound = true;
+	              grantIssued = true;
+	            }
+	          }
+	          if (issuedThisRound)
+	          {
+	            grantedSenders.insert(senderAddress.Get ());
+	            overcommitDue--;
+	            grantingPrio++;
+	          }
+	        }
+	      }
+    }
+    return grantIssued;
+  }
     
-  std::unordered_set<uint32_t> grantedSenders; // Same sender can't be granted for multiple msgs at once
-  uint8_t grantingPrio = m_homa->GetNumUnschedPrioBands (); // Scheduled priorities start here
+  std::unordered_set<uint32_t> grantedSenders;
+  uint8_t grantingPrio = m_homa->GetNumUnschedPrioBands ();
   uint8_t overcommitDue = m_homa->GetOvercommitLevel ();
+  const double baseBudget = static_cast<double> (std::max<uint16_t> (1, m_homa->GetBdp ()));
+  const uint32_t globalBudgetPkts = std::max<uint32_t> (1, m_homa->GetSirdCreditBudgetPkts ());
+
+  auto clampBudget = [baseBudget](double budget) {
+    return std::max (1.0, std::min (baseBudget, budget));
+  };
     
   Ptr<HomaInboundMsg> currentMsg;
-  for (std::size_t i = 0; i < m_inboundMsgs.size(); ++i) 
+  for (std::size_t i = 0; i < m_inboundMsgs.size(); ++i)
   {
     currentMsg = m_inboundMsgs[i];
-    currentMsg->SetCurrentlyScheduled(false);
+    currentMsg->SetCurrentlyScheduled (false);
 
     if (overcommitDue > 0)
-    {  
-      grantingPrio = std::min(grantingPrio, (uint8_t)(m_homa->GetNumTotalPrioBands()-1));
-      
-      
+    {
+      grantingPrio = std::min(grantingPrio, (uint8_t)(m_homa->GetNumTotalPrioBands() - 1));
+
       Ipv4Address senderAddress = currentMsg->GetSrcAddress ();
+      uint32_t senderKey = senderAddress.Get ();
       if (!currentMsg->IsFullyGranted () &&
-          grantedSenders.find(senderAddress.Get ()) == grantedSenders.end())
+          grantedSenders.find(senderKey) == grantedSenders.end())
       {
-        if (m_busySenders.find(senderAddress.Get ()) == m_busySenders.end())
+        if (m_busySenders.find(senderKey) == m_busySenders.end())
         {
-          if (currentMsg->IsGrantable ())
+          if (m_sirdSenderBudgetNetPkts.find (senderKey) == m_sirdSenderBudgetNetPkts.end ())
           {
-            m_homa->SendDown(currentMsg->GenerateGrantOrAck(grantingPrio, 
-                                                            HomaHeader::Flags_t::GRANT),
-                            currentMsg->GetDstAddress (),
-                            senderAddress); 
-            currentMsg->SetCurrentlyScheduled(true);
+            m_sirdSenderBudgetNetPkts[senderKey] = baseBudget;
           }
-          
-          grantedSenders.insert(senderAddress.Get ());
-          
-        }
-        overcommitDue--;
-        grantingPrio++;
-      }
-    }
+          if (m_sirdSenderBudgetHostPkts.find (senderKey) == m_sirdSenderBudgetHostPkts.end ())
+          {
+            m_sirdSenderBudgetHostPkts[senderKey] = baseBudget;
+          }
+
+          double netBudget = m_sirdSenderBudgetNetPkts[senderKey];
+          bool senderCe = false;
+          auto ceIt = m_sirdSenderCeState.find (senderKey);
+          if (ceIt != m_sirdSenderCeState.end ())
+          {
+            senderCe = ceIt->second;
+          }
+          if (senderCe)
+          {
+            netBudget = clampBudget (netBudget * m_homa->GetSirdEcnMdFactor ());
+          }
+          else
+          {
+            netBudget = clampBudget (netBudget + m_homa->GetSirdEcnAiStep ());
+          }
+          m_sirdSenderBudgetNetPkts[senderKey] = netBudget;
+
+          bool senderCsn = false;
+          auto csnIt = m_sirdSenderCsnState.find (senderKey);
+          if (csnIt != m_sirdSenderCsnState.end ())
+          {
+            senderCsn = csnIt->second;
+          }
+
+          double hostBudget = m_sirdSenderBudgetHostPkts[senderKey];
+          if (senderCsn)
+          {
+            hostBudget = clampBudget (hostBudget * m_homa->GetSirdSenderMdFactor ());
+          }
+          else
+          {
+            hostBudget = clampBudget (hostBudget + m_homa->GetSirdSenderAiStep ());
+          }
+          m_sirdSenderBudgetHostPkts[senderKey] = hostBudget;
+
+          double budget = std::min (netBudget, hostBudget);
+
+          if (m_sirdSenderCreditsInUsePkts.find (senderKey) == m_sirdSenderCreditsInUsePkts.end ())
+          {
+            m_sirdSenderCreditsInUsePkts[senderKey] = 0;
+          }
+
+          uint32_t senderBudgetPkts = static_cast<uint32_t> (std::max (1.0, budget));
+          uint32_t senderInUsePkts = m_sirdSenderCreditsInUsePkts[senderKey];
+          uint32_t senderAvailPkts = (senderBudgetPkts > senderInUsePkts) ? (senderBudgetPkts - senderInUsePkts) : 0;
+          uint32_t globalAvailPkts = (globalBudgetPkts > m_sirdGlobalCreditsInUsePkts) ?
+                                     (globalBudgetPkts - m_sirdGlobalCreditsInUsePkts) : 0;
+          bool issuedThisRound = false;
+
+          // SIRD issues one MSS-sized credit per tick. The credit bucket, not
+          // data arrival, should decide whether the next grant can be exposed.
+          if (senderAvailPkts > 0 && globalAvailPkts > 0 && !currentMsg->IsGrantable ())
+          {
+            currentMsg->AdvanceGrantableWindow (1);
+          }
+
+          if (senderAvailPkts > 0 && globalAvailPkts > 0 && currentMsg->IsGrantable ())
+          {
+            Ptr<Packet> grantPkt = currentMsg->GenerateGrantOrAck(grantingPrio,
+                                                                   HomaHeader::Flags_t::GRANT);
+            HomaHeader traceHeader;
+            grantPkt->PeekHeader (traceHeader);
+
+            m_homa->TraceSirdGrantDecision (senderAddress,
+                                            currentMsg->GetTxMsgId (),
+                                            traceHeader.GetGrantOffset (),
+                                            budget,
+                                            m_sirdCeRatioEwma,
+                                            senderCsn);
+
+            m_homa->SendDown(grantPkt,
+                            currentMsg->GetDstAddress (),
+                            senderAddress);
+            currentMsg->SetCurrentlyScheduled(true);
+            m_sirdSenderCreditsInUsePkts[senderKey]++;
+            m_sirdGlobalCreditsInUsePkts++;
+            issuedThisRound = true;
+            grantIssued = true;
+          }
+
+	          m_homa->TraceSirdBucketState (currentMsg->GetDstAddress (),
+	                                        senderAddress,
+	                                        hostBudget,
+	                                        m_sirdSenderCreditsInUsePkts[senderKey],
+	                                        m_sirdGlobalCreditsInUsePkts,
+	                                        globalBudgetPkts,
+	                                        issuedThisRound ? 1 : 0);
+
+	          if (issuedThisRound)
+	          {
+	            grantedSenders.insert(senderKey);
+	            overcommitDue--;
+	            grantingPrio++;
+	          }
+	        }
+	      }
+	    }
   }
+  return grantIssued;
+}
+
+void
+HomaRecvScheduler::EnsureCreditTickScheduled (bool immediate)
+{
+  if (m_creditTickEvent.IsRunning ())
+    {
+      return;
+    }
+
+  if (!HasGrantOpportunity ())
+    {
+      return;
+    }
+
+  Time delay = immediate ? Time (0) : GetCreditTickInterval ();
+  m_creditTickEvent = Simulator::Schedule (delay, &HomaRecvScheduler::CreditTick, this);
+}
+
+void
+HomaRecvScheduler::CreditTick (void)
+{
+  m_creditTickEvent = EventId ();
+
+  bool issued = SendAppropriateGrants ();
+  if (!issued)
+    {
+      return;
+    }
+
+  if (HasGrantOpportunity ())
+    {
+      m_creditTickEvent = Simulator::Schedule (GetCreditTickInterval (),
+                                               &HomaRecvScheduler::CreditTick,
+                                               this);
+    }
+}
+
+bool
+HomaRecvScheduler::HasGrantOpportunity (void) const
+{
+  const uint32_t globalBudgetPkts = std::max<uint32_t> (1, m_homa->GetSirdCreditBudgetPkts ());
+  if (m_sirdGlobalCreditsInUsePkts >= globalBudgetPkts)
+    {
+      return false;
+    }
+
+  const double baseBudget = static_cast<double> (std::max<uint16_t> (1, m_homa->GetBdp ()));
+
+  for (const auto& currentMsg : m_inboundMsgs)
+    {
+      uint32_t senderKey = currentMsg->GetSrcAddress ().Get ();
+      if (currentMsg->IsFullyGranted ())
+        {
+          continue;
+        }
+      if (m_busySenders.find (senderKey) != m_busySenders.end ())
+        {
+          continue;
+        }
+
+      double netBudget = baseBudget;
+      auto netIt = m_sirdSenderBudgetNetPkts.find (senderKey);
+      if (netIt != m_sirdSenderBudgetNetPkts.end ())
+        {
+          netBudget = netIt->second;
+        }
+
+      double hostBudget = baseBudget;
+      auto hostIt = m_sirdSenderBudgetHostPkts.find (senderKey);
+      if (hostIt != m_sirdSenderBudgetHostPkts.end ())
+        {
+          hostBudget = hostIt->second;
+        }
+
+      double budget = std::min (netBudget, hostBudget);
+      uint32_t senderBudgetPkts = static_cast<uint32_t> (std::max (1.0, budget));
+      uint32_t senderInUsePkts = 0;
+      auto inUseIt = m_sirdSenderCreditsInUsePkts.find (senderKey);
+      if (inUseIt != m_sirdSenderCreditsInUsePkts.end ())
+        {
+          senderInUsePkts = inUseIt->second;
+        }
+
+      if (senderBudgetPkts > senderInUsePkts)
+        {
+          return true;
+        }
+    }
+  return false;
+}
+
+Time
+HomaRecvScheduler::GetCreditTickInterval (void) const
+{
+  return m_homa->GetFullDataPktTxTime ();
 }
     
+// 接收侧超时处理：必要时发 RESEND，重置定时器并更新无进展重传计数。
 void HomaRecvScheduler::ExpireRtxTimeout(Ptr<HomaInboundMsg> inboundMsg,
                                          uint16_t maxRsndPktOffset)
 {

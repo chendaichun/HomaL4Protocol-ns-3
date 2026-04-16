@@ -28,6 +28,8 @@
 #include "wimax-net-device.h"
 #include "simple-ofdm-wimax-phy.h"
 #include "wimax-channel.h"
+
+#include <vector>
 #include "ns3/packet-burst.h"
 #include "wimax-mac-header.h"
 #include "simple-ofdm-wimax-channel.h"
@@ -524,8 +526,8 @@ SimpleOfdmWimaxPhy::ConvertBurstToBits (Ptr<const PacketBurst> burst)
 Ptr<PacketBurst>
 SimpleOfdmWimaxPhy::ConvertBitsToBurst (bvec buffer)
 {
-  uint8_t init[buffer.size () / 8];
-  uint8_t *pstart = init;
+  std::vector<uint8_t> init (buffer.size () / 8);
+  uint8_t *pstart = init.data ();
   uint8_t temp;
   int32_t j = 0;
   // recreating byte buffer from bit buffer (bvec)

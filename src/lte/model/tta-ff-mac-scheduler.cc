@@ -1059,15 +1059,12 @@ TtaFfMacScheduler::DoSchedDlTriggerReq (const struct FfMacSchedSapProvider::Sche
         {
           NS_LOG_INFO (this << " Layer " << (uint16_t)j << " CQI selected " << (uint16_t)worstCqi.at (j));
         }
-      uint32_t bytesTxed = 0;
       for (uint8_t j = 0; j < nLayer; j++)
         {
           newDci.m_mcs.push_back (m_amc->GetMcsFromCqi (worstCqi.at (j)));
           int tbSize = (m_amc->GetDlTbSizeFromMcs (newDci.m_mcs.at (j), RgbPerRnti * rbgSize) / 8); // (size of TB in bytes according to table 7.1.7.2.1-1 of 36.213)
           newDci.m_tbsSize.push_back (tbSize);
           NS_LOG_INFO (this << " Layer " << (uint16_t)j << " MCS selected" << m_amc->GetMcsFromCqi (worstCqi.at (j)));
-
-          bytesTxed += tbSize;
         }
 
       newDci.m_resAlloc = 0;  // only allocation type 0 at this stage
@@ -1270,7 +1267,6 @@ TtaFfMacScheduler::DoSchedUlTriggerReq (const struct FfMacSchedSapProvider::Sche
   // Generate RBs map
   FfMacSchedSapUser::SchedUlConfigIndParameters ret;
   std::vector <bool> rbMap;
-  uint16_t rbAllocatedNum = 0;
   std::set <uint16_t> rntiAllocated;
   std::vector <uint16_t> rbgAllocationMap;
   // update with RACH allocation map
@@ -1341,7 +1337,6 @@ TtaFfMacScheduler::DoSchedUlTriggerReq (const struct FfMacSchedSapProvider::Sche
                       rbMap.at (j) = true;
                       rbgAllocationMap.at (j) = dci.m_rnti;
                       NS_LOG_INFO ("\tRB " << j);
-                      rbAllocatedNum++;
                     }
                   NS_LOG_INFO (this << " Send retx in the same RBs " << (uint16_t)dci.m_rbStart << " to " << dci.m_rbStart + dci.m_rbLen << " RV " << (*itStat).second.at (harqId) + 1);
                 }

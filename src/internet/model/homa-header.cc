@@ -47,6 +47,7 @@ HomaHeader::HomaHeader ()
     m_txMsgId (0),
     m_flags (0),
     m_prio (0xff),
+    m_feedbackFlags (0),
     m_msgSizeBytes (0),
     m_pktOffset (0),
     m_grantOffset (0),
@@ -82,6 +83,7 @@ HomaHeader::Print (std::ostream &os) const
      << " " << m_srcPort << " > " << m_dstPort
      << " txMsgId: " << m_txMsgId
      << " prio: " << (uint16_t)m_prio
+    << " fb: " << (uint16_t)m_feedbackFlags
      << " gen: " << m_generation
      << " msgSize: " << m_msgSizeBytes
      << " pktOffset: " << m_pktOffset
@@ -96,7 +98,7 @@ HomaHeader::GetSerializedSize (void) const
   /* Note: The original Homa implementation has a slighly different packet 
    *       header format for every type of Homa packet.
    */
-  return 20; 
+  return 21;
   // TODO: If the above value is updated, update the default payload size
   //       in the declaration of Homa nanoPU implementation.
 }
@@ -139,6 +141,7 @@ HomaHeader::Serialize (Buffer::Iterator start) const
   i.WriteHtonU16 (m_txMsgId);
   i.WriteU8 (m_flags);
   i.WriteU8 (m_prio);
+  i.WriteU8 (m_feedbackFlags);
   i.WriteHtonU32 (m_msgSizeBytes);
   i.WriteHtonU16 (m_pktOffset);
   i.WriteHtonU16 (m_grantOffset);
@@ -154,6 +157,7 @@ HomaHeader::Deserialize (Buffer::Iterator start)
   m_txMsgId = i.ReadNtohU16 ();
   m_flags = i.ReadU8 ();
   m_prio = i.ReadU8 ();
+  m_feedbackFlags = i.ReadU8 ();
   m_msgSizeBytes = i.ReadNtohU32 ();
   m_pktOffset = i.ReadNtohU16 ();
   m_grantOffset = i.ReadNtohU16 ();
@@ -216,6 +220,17 @@ uint8_t
 HomaHeader::GetPrio (void) const
 {
   return m_prio;
+}
+
+void
+HomaHeader::SetFeedbackFlags (uint8_t flags)
+{
+  m_feedbackFlags = flags;
+}
+uint8_t
+HomaHeader::GetFeedbackFlags (void) const
+{
+  return m_feedbackFlags;
 }
     
 void 

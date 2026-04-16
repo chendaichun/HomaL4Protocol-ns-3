@@ -24,6 +24,7 @@
 #include <sstream>
 #include <stdlib.h>
 #include <errno.h>
+#include <vector>
 
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -114,7 +115,7 @@ SendSocket (const char *path, int fd, const int magic_number)
   // so we call it "control."
   //
   size_t msg_size = sizeof(int);
-  char control[CMSG_SPACE (msg_size)];
+  std::vector<char> control (CMSG_SPACE (msg_size));
 
   //
   // There is a msghdr that is used to minimize the number of parameters
@@ -132,8 +133,8 @@ SendSocket (const char *path, int fd, const int magic_number)
   msg.msg_namelen = 0;
   msg.msg_iov = &iov;
   msg.msg_iovlen = 1;
-  msg.msg_control = control;
-  msg.msg_controllen = sizeof (control);
+  msg.msg_control = control.data ();
+  msg.msg_controllen = control.size ();
   msg.msg_flags = 0;
 
   //

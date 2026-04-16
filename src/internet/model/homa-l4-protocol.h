@@ -108,6 +108,18 @@ public:
    * \return The number of packets required for full utilization, ie. BDP.
    */
   uint16_t GetBdp(void) const;
+
+  /**
+   * \brief Get serialization time of one full-sized data packet on this link.
+   * \return transmission time including PPP framing
+   */
+  Time GetFullDataPktTxTime (void) const;
+
+  /**
+   * \brief Get accumulated scheduled credit at the sender in packets.
+   * \return total unconsumed scheduled credit across outbound messages
+   */
+  uint32_t GetAccumulatedSenderCreditPkts (void) const;
     
   /**
    * \brief Get the protocol number associated with Homa Transport.
@@ -150,6 +162,120 @@ public:
    * \return Minimum number of messages to Grant at the same time
    */
   uint8_t GetOvercommitLevel (void) const;
+
+  /**
+   * \brief Whether receiver scheduling is FIFO/SRR-like instead of SRPT.
+   * \return true when SRR-like ordering is enabled
+   */
+  bool UseSrrScheduling (void) const;
+
+  /**
+   * \brief Whether SIRD-compatible control path is enabled.
+   * \return true if SIRD path is enabled
+   */
+  bool IsSirdEnabled (void) const;
+
+  /**
+   * \brief Baseline grant budget in packets for SIRD receiver logic.
+   * \return grant budget in packets
+   */
+  uint16_t GetSirdCreditBudgetPkts (void) const;
+
+  /**
+   * \brief Unscheduled threshold in packets for line-rate startup.
+   * \return threshold in packets
+   */
+  uint16_t GetSirdUnschThresholdPkts (void) const;
+
+  /**
+   * \brief Multiplicative decrease factor for ECN loop.
+   * \return ECN multiplicative decrease factor
+   */
+  double GetSirdEcnMdFactor (void) const;
+
+  /**
+   * \brief Additive increase amount for ECN loop.
+   * \return ECN additive increase amount in packets
+   */
+  double GetSirdEcnAiStep (void) const;
+
+  /**
+   * \brief Multiplicative decrease factor for sender congestion loop.
+   * \return sender feedback multiplicative decrease factor
+   */
+  double GetSirdSenderMdFactor (void) const;
+
+  /**
+   * \brief Additive increase amount for sender congestion loop.
+   * \return sender feedback additive increase amount in packets
+   */
+  double GetSirdSenderAiStep (void) const;
+
+  /**
+   * \brief EWMA gain for ECN mark ratio estimation.
+   * \return EWMA gain in [0,1]
+   */
+  double GetSirdEcnAlphaGain (void) const;
+
+  /**
+   * \brief Sender backlog threshold used to mark csn.
+   * \return queue drain time threshold
+   */
+  uint16_t GetSirdSenderCsnThreshold (void) const;
+
+  /**
+   * \brief Emit a SIRD grant-decision trace record.
+   * \param sender Source sender address
+   * \param txMsgId Message ID on sender side
+   * \param grantOffset Granted packet offset
+   * \param senderBudgetPkts Sender budget after control update
+   * \param ecnEwma ECN CE-ratio EWMA
+   * \param senderCsn Sender congestion feedback bit
+   */
+  void TraceSirdGrantDecision (Ipv4Address sender,
+                               uint16_t txMsgId,
+                               uint16_t grantOffset,
+                               double senderBudgetPkts,
+                               double ecnEwma,
+                               bool senderCsn);
+
+  /**
+   * \brief Emit a SIRD bucket-state trace record.
+   * \param receiver Receiver address owning the bucket state
+   * \param sender Source sender address
+   * \param senderBudgetHostPkts Sender host-side bucket budget
+   * \param senderCreditsInUsePkts Sender outstanding credits in use
+   * \param globalCreditsInUsePkts Global outstanding credits in use
+   * \param globalBudgetPkts Global credit budget
+   * \param eventType 1=grant-issued, 2=credit-reclaimed, 0=no-grant
+   */
+  void TraceSirdBucketState (Ipv4Address receiver,
+                             Ipv4Address sender,
+                             double senderBudgetHostPkts,
+                             uint32_t senderCreditsInUsePkts,
+                             uint32_t globalCreditsInUsePkts,
+                             uint32_t globalBudgetPkts,
+                             uint8_t eventType);
+
+  /**
+   * \brief Emit a per-packet SIRD state trace record.
+   * \param receiver Receiver address handling this packet
+   * \param sender Sender address of this packet
+   * \param flags Homa flags field
+   * \param msgPktState Packed state: high 16 bits=txMsgId, low 16 bits=pktOffset
+   * \param grantOffset Grant offset field
+   * \param ecn IPv4 ECN field (0..3)
+   * \param csn Whether CSN feedback bit is set
+   * \param creditState Packed credits: low 16 bits=senderInUse, high 16 bits=globalInUse
+   */
+  void TraceSirdPacketState (Ipv4Address receiver,
+                             Ipv4Address sender,
+                             uint8_t flags,
+                             uint32_t msgPktState,
+                             uint16_t grantOffset,
+                             uint8_t ecn,
+                             bool csn,
+                             uint32_t creditState);
     
   /**
    * \brief Return whether the memory optimizations are enabled
@@ -322,6 +448,16 @@ private:
   uint8_t m_numTotalPrioBands;   //!< Total number of priority levels used within the network
   uint8_t m_numUnschedPrioBands; //!< Number of priority bands dedicated for unscheduled packets
   uint8_t m_overcommitLevel;     //!< Minimum number of messages to Grant at the same time
+  bool m_useSrrScheduling;       //!< Keep active inbound messages in FIFO/SRR-like order instead of SRPT
+  bool m_sirdEnabled;            //!< Whether SIRD-compatible grant/feedback logic is enabled
+  uint16_t m_sirdCreditBudgetPkts; //!< Baseline grant budget in packets
+  uint16_t m_sirdUnschThresholdPkts; //!< Threshold for line-rate startup in packets
+  double m_sirdEcnMdFactor;      //!< Multiplicative decrease factor for ECN loop
+  double m_sirdEcnAiStep;        //!< Additive increase step for ECN loop
+  double m_sirdSenderMdFactor;   //!< Multiplicative decrease factor for sender feedback loop
+  double m_sirdSenderAiStep;     //!< Additive increase step for sender feedback loop
+  double m_sirdEcnAlphaGain;     //!< EWMA gain for ECN mark ratio
+  uint16_t m_sirdSenderCsnThreshold; //!< Threshold for sender congestion notification in packets
     
   DataRate m_linkRate;       //!< Data Rate of the corresponding net device for this prototocol
   Time m_nextTimeTxQueWillBeEmpty;   //!< Total amount of bytes serialized since the last time 
@@ -342,6 +478,13 @@ private:
                  uint16_t, uint16_t> m_dataSendTrace; //!< Trace of {pkt, srcIp, dstIp, srcPort, dstPort, txMsgId, pktOffset, prio} for departing DATA packets
   TracedCallback<Ptr<const Packet>, Ipv4Address, Ipv4Address, uint16_t, uint16_t, uint8_t, 
                  uint16_t, uint8_t> m_ctrlRecvTrace; //!< Trace of {pkt, srcIp, dstIp, srcPort, dstPort, falg, grantOffset, prio} for arriving control packets
+  TracedCallback<Ipv4Address, Ipv4Address, uint16_t, uint16_t, uint16_t,
+                 uint8_t, uint16_t, uint8_t> m_ctrlRecvTxMsgTrace; //!< Trace of {srcIp, dstIp, srcPort, dstPort, txMsgId, flags, grantOffset, prio} for arriving control packets
+  TracedCallback<Ipv4Address, Ipv4Address, uint16_t, uint16_t, uint16_t,
+                 uint8_t, uint8_t, Time> m_pathRttTrace; //!< Trace of {senderIp, receiverIp, srcPort, dstPort, txMsgId, triggerKind, ctrlFlags, pathRtt} for Homa-derived path RTT
+  TracedCallback<Ipv4Address, uint16_t, uint16_t, double, double, bool> m_sirdGrantDecisionTrace; //!< Trace of {senderIp, txMsgId, grantOffset, senderBudgetPkts, ecnEwma, csn}
+  TracedCallback<Ipv4Address, Ipv4Address, double, uint32_t, uint32_t, uint32_t, uint8_t> m_sirdBucketStateTrace; //!< Trace of {receiverIp, senderIp, senderBudgetHostPkts, senderInUsePkts, globalInUsePkts, globalBudgetPkts, eventType}
+  TracedCallback<Ipv4Address, Ipv4Address, uint8_t, uint32_t, uint16_t, uint8_t, bool, uint32_t> m_sirdPacketStateTrace; //!< Trace of per-packet SIRD state
 };
     
 /******************************************************************************/
@@ -441,6 +584,24 @@ public:
    * \return Whether a packet was successfully selected for this message 
    */
   bool GetNextPktOffset (uint16_t &pktOffset);
+
+  /**
+   * \brief Whether this message must send a zero-payload credit request first.
+   * \return true if an initial request packet should be transmitted
+   */
+  bool NeedsInitialCreditRequest (void) const;
+
+  /**
+   * \brief Mark the initial credit request as transmitted.
+   */
+  void MarkInitialCreditRequestSent (void);
+
+  /**
+   * \brief Generate a zero-payload DATA packet to request initial credits.
+   * \param txMsgId The txMsgId assigned by HomaSendScheduler
+   * \return The generated request packet
+   */
+  Ptr<Packet> GenerateInitialCreditRequest (uint16_t txMsgId);
   
   /**
    * \brief Remove the next packet from the TX queue of this message
@@ -479,6 +640,12 @@ public:
    * \param lastRtxGrntIdx The m_maxGrantedIdx value as of the time rtx timer was set
    */
   void ExpireRtxTimeout(uint16_t lastRtxGrntIdx);
+
+  /**
+   * \brief Get currently accumulated scheduled credit for this message in packets.
+   * \return number of granted-but-unsent scheduled packets
+   */
+  uint16_t GetAccumulatedCreditPkts (void) const;
   
 private:
   Ipv4Address m_saddr;       //!< Source IP address of this message
@@ -501,6 +668,8 @@ private:
   
   uint8_t m_prio;            //!< The most recent priority of the message
   bool m_prioSetByReceiver;  //!< Whether the receiver has specified a priority yet
+  bool m_waitForFirstGrant;  //!< Whether first data packet must wait for explicit GRANT
+  bool m_initialCreditRequestSent; //!< Whether the initial zero-payload request was sent
   
   EventId m_rtxEvent;        //!< The EventID for the retransmission timeout
   bool m_isExpired;          //!< Whether this message has expired and to be cleared upon rtx timeouts
@@ -571,6 +740,12 @@ public:
    * \param txMsgId The TX msg ID of the message to be cleared
    */
   void ClearStateForMsg (uint16_t txMsgId);
+
+  /**
+   * \brief Get total accumulated scheduled credit across all outbound messages.
+   * \return total unconsumed scheduled credit in packets
+   */
+  uint32_t GetAccumulatedCreditPkts (void) const;
   
 private:
   Ptr<HomaL4Protocol> m_homa; //!< the protocol instance itself that sends/receives messages
@@ -596,8 +771,9 @@ public:
    */
   static TypeId GetTypeId (void);
 
-  HomaInboundMsg (Ptr<Packet> p, Ipv4Header const &ipv4Header, HomaHeader const &homaHeader, 
-                  Ptr<Ipv4Interface> iface, uint32_t mtuBytes, uint16_t rttPackets, bool memIsOptimized);
+  HomaInboundMsg (Ptr<Packet> p, Ipv4Header const &ipv4Header, HomaHeader const &homaHeader,
+                  Ptr<Ipv4Interface> iface, uint32_t mtuBytes, uint16_t rttPackets,
+                  bool memIsOptimized, bool sirdEnabled, uint16_t sirdUnschThresholdPkts);
   ~HomaInboundMsg (void);
   
   /**
@@ -659,6 +835,18 @@ public:
    * \return The highest grantable packet index so far
    */
   uint16_t GetMaxGrantableIdx (void);
+
+  /**
+   * \brief Cap the grantable window relative to the latest granted offset.
+   * \param grantWindowPkts window size in packets to allow beyond max granted index
+   */
+  void CapGrantableWindow (uint16_t grantWindowPkts);
+  /**
+   * \brief Advance the grantable boundary by newly issued SIRD credit.
+   * \param grantPkts number of packet credits to expose to the grant generator
+   * \return true if the grantable boundary moved forward
+   */
+  bool AdvanceGrantableWindow (uint16_t grantPkts);
   /**
    * \brief Get the highest granted packet index for this message.
    * \return The highest granted packet index so far
@@ -761,6 +949,7 @@ private:
   uint16_t m_maxGrantableIdx;//!< Highest Grant Offset determined so far (default: m_rttPackets)
   uint16_t m_maxGrantedIdx;  //!< Highest Grant Offset sent so far
   uint8_t m_prio;            //!< The most recent granted priority set for this message
+  bool m_hasGrantedData;     //!< Whether at least one real DATA packet has been granted
   bool m_currentlyScheduled; //!< Whether this message is prioritized enough to be actively granted
   
   EventId m_rtxEvent;        //!< The EventID for the retransmission timeout
@@ -851,7 +1040,7 @@ public:
     /**
    * \brief Loop through the list of active messages and send Grants to the grantable ones
    */
-  void SendAppropriateGrants(void);
+  bool SendAppropriateGrants(void);
   
   /**
    * \brief Gets appropriate RESEND packets for the inbound message and sends them down.
@@ -859,12 +1048,27 @@ public:
    * \param maxRsndPktOffset The highest packet index to send RESEND for 
    */
   void ExpireRtxTimeout(Ptr<HomaInboundMsg> inboundMsg, uint16_t maxRsndPktOffset);
+
+  void EnsureCreditTickScheduled (bool immediate);
+  void CreditTick (void);
+  bool HasGrantOpportunity (void) const;
+  Time GetCreditTickInterval (void) const;
   
 private:
   Ptr<HomaL4Protocol> m_homa; //!< the protocol instance itself that sends/receives messages
   
   std::vector<Ptr<HomaInboundMsg>> m_inboundMsgs; //!< Sorted vector of inbound messages that are to be scheduled
   std::unordered_set<uint32_t>  m_busySenders; //!< Set of senders from whom the last received pkt type is BUSY
+  std::unordered_map<uint32_t, double> m_sirdSenderBudgetNetPkts; //表示每个 sender 在“网络核心拥塞”这条控制环下允许拥有的 credit 上限，单位是 packet。这个值主要根据 ECN/CE 做 AI/MD 调整。
+  std::unordered_map<uint32_t, double> m_sirdSenderBudgetHostPkts; //表示每个 sender 在“发送端拥塞”这条控制环下允许拥有的 credit 上限，初始化为 1bdp
+  std::unordered_map<uint32_t, uint32_t> m_sirdSenderCreditsInUsePkts; //当前已经借出去多少 credit
+  std::unordered_map<uint32_t, bool> m_sirdSenderCsnState; //!< Last seen csn feedback per sender
+  std::unordered_map<uint32_t, bool> m_sirdSenderCeState; //!< Last seen CE mark per sender
+  uint32_t m_sirdGlobalCreditsInUsePkts; //当前已经借出去多少 credit 全局B
+  double m_sirdCeRatioEwma; //!< EWMA of ECN CE ratio over received data packets
+  uint64_t m_sirdDataPktsObserved; //!< Number of data packets observed for ECN ratio estimation
+  uint64_t m_sirdCeMarksObserved; //!< Number of CE-marked packets observed
+  EventId m_creditTickEvent; //!< Periodic event for tick-driven credit issuance
 };
     
 } // namespace ns3

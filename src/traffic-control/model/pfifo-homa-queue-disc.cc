@@ -25,7 +25,6 @@
  *           Tom Henderson <tomhend@u.washington.edu>
  */
 
-#include "ns3/ipv4-queue-disc-item.h"
 #include "ns3/log.h"
 #include "ns3/object-factory.h"
 #include "ns3/queue.h"
@@ -84,15 +83,16 @@ PfifoHomaQueueDisc::DoEnqueue (Ptr<QueueDiscItem> item)
     }
 
   uint8_t priority = 0;
-  auto ipv4Item = DynamicCast<Ipv4QueueDiscItem>(item);
-  if (ipv4Item)
+  uint8_t dsField = 0;
+  if (item->GetUint8Value (QueueItem::IP_DSFIELD, dsField))
     {
-      priority = ipv4Item->GetHeader().GetTos();
+      // Priority is encoded in DSCP bits; low ECN bits must be ignored.
+      priority = static_cast<uint8_t> (dsField >> 2);
     }
 
   uint32_t band = (uint32_t)priority;
-  if (band > m_numBands)
-      band = m_numBands;
+    if (band >= m_numBands)
+      band = m_numBands - 1;
 
   bool retval = GetInternalQueue (band)->Enqueue (item);
 

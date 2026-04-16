@@ -19,6 +19,8 @@
 #include "ns3/log.h"
 #include "arp-queue-disc-item.h"
 
+#include <vector>
+
 namespace ns3 {
 
 NS_LOG_COMPONENT_DEFINE ("ArpQueueDiscItem");
@@ -99,12 +101,12 @@ ArpQueueDiscItem::Hash (uint32_t perturbation) const
   uint8_t type = m_header.IsRequest () ? ArpHeader::ARP_TYPE_REQUEST : ArpHeader::ARP_TYPE_REPLY;
 
   /* serialize the addresses and the perturbation in buf */
-  uint8_t tmp = 8 + macSrc.GetLength () + macDst.GetLength ();
-  uint8_t buf[tmp + 5];
-  ipv4Src.Serialize (buf);
-  ipv4Dst.Serialize (buf + 4);
-  macSrc.CopyTo (buf + 8);
-  macDst.CopyTo (buf + 8 + macSrc.GetLength ());
+  const uint8_t tmp = 8 + macSrc.GetLength () + macDst.GetLength ();
+  std::vector<uint8_t> buf (tmp + 5);
+  ipv4Src.Serialize (buf.data ());
+  ipv4Dst.Serialize (buf.data () + 4);
+  macSrc.CopyTo (buf.data () + 8);
+  macDst.CopyTo (buf.data () + 8 + macSrc.GetLength ());
   buf[tmp] = type;
   buf[tmp+1] = (perturbation >> 24) & 0xff;
   buf[tmp+2] = (perturbation >> 16) & 0xff;
@@ -114,7 +116,7 @@ ArpQueueDiscItem::Hash (uint32_t perturbation) const
   // Linux calculates jhash2 (jenkins hash), we calculate murmur3 because it is
   // already available in ns-3
 
-  uint32_t hash = Hash32 ((char*) buf, tmp+5);
+  uint32_t hash = Hash32 (reinterpret_cast<char*> (buf.data ()), tmp + 5);
 
   NS_LOG_DEBUG ("Hash value " << hash);
 

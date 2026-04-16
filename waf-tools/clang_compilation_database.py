@@ -14,7 +14,10 @@ Usage:
         conf.load('clang_compilation_database')
 """
 
-import sys, os, json, shlex, pipes
+import sys, os, json, shlex
+
+if sys.hexversion < 0x3030000:
+	import pipes
 from waflib import Logs, TaskGen, Task
 from waflib.Tools import c, cxx
 
@@ -65,4 +68,3 @@ def write_compilation_database(ctx):
 		clang_db[filename] = entry
 	root = list(clang_db.values())
 	database_file.write(json.dumps(root, indent=2))
-

@@ -104,7 +104,7 @@ def configure(conf):
 
 def build(bld):
     # bridge dependency is due to global routing
-    obj = bld.create_ns3_module('internet', ['bridge', 'traffic-control', 'network', 'core'])
+    obj = bld.create_ns3_module('internet', ['bridge', 'traffic-control', 'point-to-point', 'network', 'core'])
     obj.source = [
         'model/ip-l4-protocol.cc',
         'model/udp-header.cc',
@@ -462,4 +462,3 @@ def build(bld):
         bld.recurse('examples')
 
     bld.ns3_python_bindings()
-

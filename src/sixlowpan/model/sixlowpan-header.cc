@@ -274,8 +274,6 @@ void SixLowPanHc1::Serialize (Buffer::Iterator start) const
 uint32_t SixLowPanHc1::Deserialize (Buffer::Iterator start)
 {
   Buffer::Iterator i = start;
-  uint32_t serializedSize = 3;
-
   uint8_t dispatch = i.ReadU8 ();
   if (dispatch != SixLowPanDispatch::LOWPAN_HC1)
     {
@@ -302,21 +300,18 @@ uint32_t SixLowPanHc1::Deserialize (Buffer::Iterator start)
         {
           m_srcInterface[j] = i.ReadU8 ();
         }
-      serializedSize += 16;
       break;
     case HC1_PIIC:
       for ( int j = 0; j < 8; j++)
         {
           m_srcPrefix[j] = i.ReadU8 ();
         }
-      serializedSize += 8;
       break;
     case HC1_PCII:
       for ( int j = 0; j < 8; j++)
         {
           m_srcInterface[j] = i.ReadU8 ();
         }
-      serializedSize += 8;
       break;
     case HC1_PCIC:
       break;
@@ -332,21 +327,18 @@ uint32_t SixLowPanHc1::Deserialize (Buffer::Iterator start)
         {
           m_dstInterface[j] = i.ReadU8 ();
         }
-      serializedSize += 16;
       break;
     case HC1_PIIC:
       for ( int j = 0; j < 8; j++)
         {
           m_dstPrefix[j] = i.ReadU8 ();
         }
-      serializedSize += 8;
       break;
     case HC1_PCII:
       for ( int j = 0; j < 8; j++)
         {
           m_dstInterface[j] = i.ReadU8 ();
         }
-      serializedSize += 8;
       break;
     case HC1_PCIC:
       break;
@@ -360,14 +352,12 @@ uint32_t SixLowPanHc1::Deserialize (Buffer::Iterator start)
       m_flowLabel = temp[2];
       m_flowLabel = (m_flowLabel << 8) | temp[1];
       m_flowLabel = (m_flowLabel << 8) | temp[0];
-      serializedSize += 4;
     }
 
   switch ( m_nextHeaderCompression )
     {
     case HC1_NC:
       m_nextHeader = i.ReadU8 ();
-      serializedSize++;
       break;
     case HC1_TCP:
       m_nextHeader = Ipv6Header::IPV6_TCP;
@@ -2066,4 +2056,3 @@ std::ostream & operator << (std::ostream & os, const SixLowPanMesh & h)
 }
 
 }
-
