@@ -276,6 +276,31 @@ public:
                              uint8_t ecn,
                              bool csn,
                              uint32_t creditState);
+
+  /**
+   * \brief Emit a per-sender SIRD control-loop state trace record.
+   * \param receiver Receiver address owning the control state
+   * \param sender Sender address whose state is sampled
+   * \param netBudgetPkts Network-side sender budget after CE loop update
+   * \param hostBudgetPkts Host-side sender budget after CSN loop update
+   * \param effectiveBudgetPkts Effective sender budget used for grant gating
+   * \param ceEwma Receiver-wide CE EWMA value
+   * \param loopState Packed loop state:
+   *   bit0=senderCe, bit1=senderCsn, bits[2..3]=eventType,
+   *   bits[8..23]=senderCreditsInUsePkts, bits[24..39]=globalCreditsInUsePkts,
+   *   bits[40..55]=globalBudgetPkts
+   * \param counterState Packed counters:
+   *   bits[0..20]=ceMarksObserved, bits[21..41]=csnMarksObserved,
+   *   bits[42..62]=dataPktsObserved
+   */
+  void TraceSirdLoopState (Ipv4Address receiver,
+                           Ipv4Address sender,
+                           double netBudgetPkts,
+                           double hostBudgetPkts,
+                           double effectiveBudgetPkts,
+                           double ceEwma,
+                           uint64_t loopState,
+                           uint64_t counterState);
     
   /**
    * \brief Return whether the memory optimizations are enabled
@@ -485,6 +510,7 @@ private:
   TracedCallback<Ipv4Address, uint16_t, uint16_t, double, double, bool> m_sirdGrantDecisionTrace; //!< Trace of {senderIp, txMsgId, grantOffset, senderBudgetPkts, ecnEwma, csn}
   TracedCallback<Ipv4Address, Ipv4Address, double, uint32_t, uint32_t, uint32_t, uint8_t> m_sirdBucketStateTrace; //!< Trace of {receiverIp, senderIp, senderBudgetHostPkts, senderInUsePkts, globalInUsePkts, globalBudgetPkts, eventType}
   TracedCallback<Ipv4Address, Ipv4Address, uint8_t, uint32_t, uint16_t, uint8_t, bool, uint32_t> m_sirdPacketStateTrace; //!< Trace of per-packet SIRD state
+  TracedCallback<Ipv4Address, Ipv4Address, double, double, double, double, uint64_t, uint64_t> m_sirdLoopStateTrace; //!< Trace of per-sender SIRD loop state
 };
     
 /******************************************************************************/
@@ -1061,9 +1087,17 @@ private:
   std::unordered_set<uint32_t>  m_busySenders; //!< Set of senders from whom the last received pkt type is BUSY
   std::unordered_map<uint32_t, double> m_sirdSenderBudgetNetPkts; //表示每个 sender 在“网络核心拥塞”这条控制环下允许拥有的 credit 上限，单位是 packet。这个值主要根据 ECN/CE 做 AI/MD 调整。
   std::unordered_map<uint32_t, double> m_sirdSenderBudgetHostPkts; //表示每个 sender 在“发送端拥塞”这条控制环下允许拥有的 credit 上限，初始化为 1bdp
+  std::unordered_map<uint32_t, double> m_sirdSenderNetAlpha; //!< DCTCP-style CE fraction EWMA per sender
+  std::unordered_map<uint32_t, double> m_sirdSenderHostAlpha; //!< DCTCP-style CSN fraction EWMA per sender
   std::unordered_map<uint32_t, uint32_t> m_sirdSenderCreditsInUsePkts; //当前已经借出去多少 credit
   std::unordered_map<uint32_t, bool> m_sirdSenderCsnState; //!< Last seen csn feedback per sender
   std::unordered_map<uint32_t, bool> m_sirdSenderCeState; //!< Last seen CE mark per sender
+  std::unordered_map<uint32_t, uint64_t> m_sirdSenderDataPktsObserved; //!< Number of DATA packets observed per sender
+  std::unordered_map<uint32_t, uint64_t> m_sirdSenderCeMarksObserved; //!< Number of CE-marked DATA packets observed per sender
+  std::unordered_map<uint32_t, uint64_t> m_sirdSenderCsnMarksObserved; //!< Number of CSN-marked DATA packets observed per sender
+  std::unordered_map<uint32_t, uint64_t> m_sirdSenderEpochDataPkts; //!< Number of DATA packets observed in current sender epoch
+  std::unordered_map<uint32_t, uint64_t> m_sirdSenderEpochCeMarks; //!< Number of CE-marked DATA packets in current sender epoch
+  std::unordered_map<uint32_t, uint64_t> m_sirdSenderEpochCsnMarks; //!< Number of CSN-marked DATA packets in current sender epoch
   uint32_t m_sirdGlobalCreditsInUsePkts; //当前已经借出去多少 credit 全局B
   double m_sirdCeRatioEwma; //!< EWMA of ECN CE ratio over received data packets
   uint64_t m_sirdDataPktsObserved; //!< Number of data packets observed for ECN ratio estimation

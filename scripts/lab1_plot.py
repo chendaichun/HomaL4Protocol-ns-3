@@ -10,6 +10,7 @@ Expected input files are produced by scratch/lab1.cc:
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict
 import math
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -43,6 +44,44 @@ class MsgRecord:
     @property
     def fct_us(self) -> float:
         return (self.finish_ns - self.start_ns) / 1000.0
+
+
+class SirdLoopSample:
+    def __init__(
+        self,
+        time_s: float,
+        receiver: str,
+        sender: str,
+        net_budget_pkts: float,
+        host_budget_pkts: float,
+        effective_budget_pkts: float,
+        sender_ce: bool,
+        sender_csn: bool,
+        ce_ewma: float,
+        sender_credits_in_use_pkts: int,
+        global_credits_in_use_pkts: int,
+        global_budget_pkts: int,
+        ce_marks_observed: int,
+        csn_marks_observed: int,
+        data_pkts_observed: int,
+        event_type: int,
+    ) -> None:
+        self.time_s = time_s
+        self.receiver = receiver
+        self.sender = sender
+        self.net_budget_pkts = net_budget_pkts
+        self.host_budget_pkts = host_budget_pkts
+        self.effective_budget_pkts = effective_budget_pkts
+        self.sender_ce = sender_ce
+        self.sender_csn = sender_csn
+        self.ce_ewma = ce_ewma
+        self.sender_credits_in_use_pkts = sender_credits_in_use_pkts
+        self.global_credits_in_use_pkts = global_credits_in_use_pkts
+        self.global_budget_pkts = global_budget_pkts
+        self.ce_marks_observed = ce_marks_observed
+        self.csn_marks_observed = csn_marks_observed
+        self.data_pkts_observed = data_pkts_observed
+        self.event_type = event_type
 
 
 def count_msg_events(path: Path, size: int) -> Tuple[int, int]:
@@ -212,10 +251,150 @@ def parse_receiver_throughput(path: Path) -> List[Tuple[float, float]]:
     return rows
 
 
+def parse_sird_loop_trace(path: Path) -> List[SirdLoopSample]:
+    rows: List[SirdLoopSample] = []
+    if not path.exists():
+        return rows
+
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            time_ns, values = parse_kv_line(line)
+            if time_ns is None:
+                continue
+            try:
+                rows.append(
+                    SirdLoopSample(
+                        time_s=time_ns / 1e9,
+                        receiver=values["receiver"],
+                        sender=values["sender"],
+                        net_budget_pkts=float(values["netBudgetPkts"]),
+                        host_budget_pkts=float(values["hostBudgetPkts"]),
+                        effective_budget_pkts=float(values["effectiveBudgetPkts"]),
+                        sender_ce=bool(int(values["senderCe"])),
+                        sender_csn=bool(int(values["senderCsn"])),
+                        ce_ewma=float(values["ceEwma"]),
+                        sender_credits_in_use_pkts=int(values["senderCreditsInUsePkts"]),
+                        global_credits_in_use_pkts=int(values["globalCreditsInUsePkts"]),
+                        global_budget_pkts=int(values["globalBudgetPkts"]),
+                        ce_marks_observed=int(values["ceMarksObserved"]),
+                        csn_marks_observed=int(values["csnMarksObserved"]),
+                        data_pkts_observed=int(values["dataPktsObserved"]),
+                        event_type=int(values["eventType"]),
+                    )
+                )
+            except (KeyError, ValueError):
+                continue
+    return rows
+
+
 def trim_time(rows: List[Tuple[float, float]], start_sec: Optional[float]) -> List[Tuple[float, float]]:
     if start_sec is None:
         return rows
     return [(t - start_sec, value) for t, value in rows if t >= start_sec]
+
+
+def sanitize_sender(sender: str) -> str:
+    return sender.replace(":", "_").replace(".", "_")
+
+
+def build_windowed_count_series(
+    samples: List[SirdLoopSample],
+    start_sec: Optional[float],
+    window_sec: float,
+    counter_attr: str,
+) -> List[Tuple[float, int]]:
+    if not samples:
+        return []
+
+    filtered = [sample for sample in samples if start_sec is None or sample.time_s >= start_sec]
+    if not filtered:
+        return []
+
+    base_time = start_sec if start_sec is not None else filtered[0].time_s
+    bucket_counts: Dict[int, int] = defaultdict(int)
+    prev_value = 0
+    for sample in filtered:
+        current_value = int(getattr(sample, counter_attr))
+        delta = max(0, current_value - prev_value)
+        prev_value = current_value
+        bucket_idx = int(max(0.0, sample.time_s - base_time) / window_sec)
+        bucket_counts[bucket_idx] += delta
+
+    return [
+        (bucket_idx * window_sec, bucket_counts[bucket_idx])
+        for bucket_idx in sorted(bucket_counts)
+    ]
+
+
+def plot_sender_sird_loop(
+    trace_dir: Path,
+    out_dir: Path,
+    tags: List[str],
+    start_sec: Optional[float],
+    window_us: float,
+) -> None:
+    window_sec = max(window_us, 1.0) / 1e6
+    for tag in tags:
+        samples = parse_sird_loop_trace(trace_dir / f"lab1_{tag}.sird-loop.tr")
+        if not samples:
+            continue
+
+        by_sender: Dict[str, List[SirdLoopSample]] = defaultdict(list)
+        for sample in samples:
+            by_sender[sample.sender].append(sample)
+
+        for sender, sender_samples in by_sender.items():
+            sender_samples.sort(key=lambda sample: sample.time_s)
+            if start_sec is not None:
+                sender_samples = [sample for sample in sender_samples if sample.time_s >= start_sec]
+            if not sender_samples:
+                continue
+
+            xs = [(sample.time_s - (start_sec or 0.0)) for sample in sender_samples]
+            ce_counts = build_windowed_count_series(sender_samples, start_sec, window_sec, "ce_marks_observed")
+            csn_counts = build_windowed_count_series(sender_samples, start_sec, window_sec, "csn_marks_observed")
+            sender_suffix = sanitize_sender(sender)
+            sender_title = f"{infer_label(tag)} sender {sender}"
+
+            plt.figure(figsize=(8.0, 4.6))
+            ax1 = plt.gca()
+            ax1.step(xs, [sample.net_budget_pkts for sample in sender_samples], where="post", label="net budget", linewidth=1.8)
+            ax1.step(xs, [sample.effective_budget_pkts for sample in sender_samples], where="post", label="effective budget", linewidth=1.5, linestyle="--")
+            ax1.set_xlabel("Time since traffic start (s)" if start_sec is not None else "Time (s)")
+            ax1.set_ylabel("Budget (packets)")
+            ax1.set_title(f"CE Loop {sender_title}")
+            ax1.grid(True, alpha=0.25)
+            ax2 = ax1.twinx()
+            if ce_counts:
+                ce_xs, ce_ys = zip(*ce_counts)
+                ax2.bar(ce_xs, ce_ys, width=window_sec * 0.85, alpha=0.22, color="tab:red", label=f"CE count / {window_us:.0f}us")
+            ax2.set_ylabel("CE count")
+            handles1, labels1 = ax1.get_legend_handles_labels()
+            handles2, labels2 = ax2.get_legend_handles_labels()
+            ax1.legend(handles1 + handles2, labels1 + labels2, fontsize=8, loc="upper right")
+            plt.tight_layout()
+            plt.savefig(out_dir / f"lab1_sird_ce_loop_{tag}_{sender_suffix}.png", dpi=200)
+            plt.close()
+
+            plt.figure(figsize=(8.0, 4.6))
+            ax1 = plt.gca()
+            ax1.step(xs, [sample.host_budget_pkts for sample in sender_samples], where="post", label="host budget", linewidth=1.8)
+            ax1.step(xs, [sample.effective_budget_pkts for sample in sender_samples], where="post", label="effective budget", linewidth=1.5, linestyle="--")
+            ax1.set_xlabel("Time since traffic start (s)" if start_sec is not None else "Time (s)")
+            ax1.set_ylabel("Budget (packets)")
+            ax1.set_title(f"CSN Loop {sender_title}")
+            ax1.grid(True, alpha=0.25)
+            ax2 = ax1.twinx()
+            if csn_counts:
+                csn_xs, csn_ys = zip(*csn_counts)
+                ax2.bar(csn_xs, csn_ys, width=window_sec * 0.85, alpha=0.22, color="tab:purple", label=f"CSN count / {window_us:.0f}us")
+            ax2.set_ylabel("CSN count")
+            handles1, labels1 = ax1.get_legend_handles_labels()
+            handles2, labels2 = ax2.get_legend_handles_labels()
+            ax1.legend(handles1 + handles2, labels1 + labels2, fontsize=8, loc="upper right")
+            plt.tight_layout()
+            plt.savefig(out_dir / f"lab1_sird_csn_loop_{tag}_{sender_suffix}.png", dpi=200)
+            plt.close()
 
 
 def plot_fct_cdf(
@@ -385,6 +564,12 @@ def main() -> int:
         default=0.2,
         help="Traffic start time, used only to shift time-series x axes.",
     )
+    parser.add_argument(
+        "--sird-loop-window-us",
+        type=float,
+        default=500.0,
+        help="Window size in microseconds for CE/CSN count aggregation in lab1_sird_loop plots.",
+    )
     args = parser.parse_args()
 
     trace_dir = args.trace_dir
@@ -400,6 +585,7 @@ def main() -> int:
     plot_queue_timeseries(trace_dir, out_dir, tags, args.start_sec)
     plot_queue_cdf(trace_dir, out_dir, tags)
     plot_receiver_throughput(trace_dir, out_dir, tags, args.start_sec)
+    plot_sender_sird_loop(trace_dir, out_dir, tags, args.start_sec, args.sird_loop_window_us)
     write_summary(trace_dir, out_dir, tags, sizes)
 
     print(f"Wrote lab1 plots and summary to {out_dir}")

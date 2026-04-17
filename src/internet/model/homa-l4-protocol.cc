@@ -247,6 +247,10 @@ HomaL4Protocol::GetTypeId (void)
                      "Trace source for per-packet SIRD state (flags/credit/CE/CSN).",
                      MakeTraceSourceAccessor (&HomaL4Protocol::m_sirdPacketStateTrace),
                      "ns3::TracedCallback")
+    .AddTraceSource ("SirdLoopState",
+                     "Trace source for per-sender SIRD control-loop state.",
+                     MakeTraceSourceAccessor (&HomaL4Protocol::m_sirdLoopStateTrace),
+                     "ns3::TracedCallback")
   ;
   return tid;
 }
@@ -484,6 +488,26 @@ HomaL4Protocol::TraceSirdPacketState (Ipv4Address receiver,
                           ecn,
                           csn,
                           creditState);
+}
+
+void
+HomaL4Protocol::TraceSirdLoopState (Ipv4Address receiver,
+                                    Ipv4Address sender,
+                                    double netBudgetPkts,
+                                    double hostBudgetPkts,
+                                    double effectiveBudgetPkts,
+                                    double ceEwma,
+                                    uint64_t loopState,
+                                    uint64_t counterState)
+{
+  m_sirdLoopStateTrace (receiver,
+                        sender,
+                        netBudgetPkts,
+                        hostBudgetPkts,
+                        effectiveBudgetPkts,
+                        ceEwma,
+                        loopState,
+                        counterState);
 }
     
 // 根据当前状态进行条件判断，返回布尔决策供上层流程分支使用。
@@ -2329,18 +2353,51 @@ void HomaRecvScheduler::ReceivePacket (Ptr<Packet> packet,
     if (m_homa->IsSirdEnabled ())
     {
       const uint32_t senderKey = ipv4Header.GetSource ().Get ();//用 sender 的 ip 做 key
-      m_sirdSenderCsnState[senderKey] = (homaHeader.GetFeedbackFlags () & HomaHeader::FeedbackFlags_t::FEEDBACK_CSN) != 0;//从 Homa 头里的 feedbackFlags 读取 CSN 位，并更新这个 sender 最近一次的 CSN 状态
+      const double baseBudget = static_cast<double> (std::max<uint16_t> (1, m_homa->GetBdp ()));
+      auto clampBudget = [baseBudget](double budget) {
+        return std::max (1.0, std::min (baseBudget, budget));
+      };
+      if (m_sirdSenderBudgetNetPkts.find (senderKey) == m_sirdSenderBudgetNetPkts.end ())
+      {
+        m_sirdSenderBudgetNetPkts[senderKey] = baseBudget;
+      }
+      if (m_sirdSenderBudgetHostPkts.find (senderKey) == m_sirdSenderBudgetHostPkts.end ())
+      {
+        m_sirdSenderBudgetHostPkts[senderKey] = baseBudget;
+      }
+      if (m_sirdSenderNetAlpha.find (senderKey) == m_sirdSenderNetAlpha.end ())
+      {
+        m_sirdSenderNetAlpha[senderKey] = 0.0;
+      }
+      if (m_sirdSenderHostAlpha.find (senderKey) == m_sirdSenderHostAlpha.end ())
+      {
+        m_sirdSenderHostAlpha[senderKey] = 0.0;
+      }
+
+      bool senderCsn = (homaHeader.GetFeedbackFlags () & HomaHeader::FeedbackFlags_t::FEEDBACK_CSN) != 0;
+      m_sirdSenderCsnState[senderKey] = senderCsn;//从 Homa 头里的 feedbackFlags 读取 CSN 位，并更新这个 sender 最近一次的 CSN 状态
       bool ceMarked = ipv4Header.GetEcn () == Ipv4Header::ECN_CE;
       m_sirdSenderCeState[senderKey] = ceMarked;
 
       m_sirdDataPktsObserved++;//用于统计或平滑估计
+      m_sirdSenderDataPktsObserved[senderKey]++;
+      m_sirdSenderEpochDataPkts[senderKey]++;
       if (ceMarked)
       {
         m_sirdCeMarksObserved++;
+        m_sirdSenderCeMarksObserved[senderKey]++;
+        m_sirdSenderEpochCeMarks[senderKey]++;
+      }
+      if (senderCsn)
+      {
+        m_sirdSenderCsnMarksObserved[senderKey]++;
+        m_sirdSenderEpochCsnMarks[senderKey]++;
       }
       double sampleCeRatio = ceMarked ? 1.0 : 0.0;
       double alpha = m_homa->GetSirdEcnAlphaGain ();
       m_sirdCeRatioEwma = (1.0 - alpha) * m_sirdCeRatioEwma + alpha * sampleCeRatio;
+      double netBudgetPkts = m_sirdSenderBudgetNetPkts[senderKey];
+      double hostBudgetPkts = m_sirdSenderBudgetHostPkts[senderKey];
 
       // Reclaim outstanding scheduled credits as data arrives.
       if (packet->GetSize () > 0)//是 Data 包，负载大于 0
@@ -2354,23 +2411,86 @@ void HomaRecvScheduler::ReceivePacket (Ptr<Packet> packet,
             m_sirdGlobalCreditsInUsePkts--;
           }
 
-          double senderBudgetHostPkts = static_cast<double> (std::max<uint16_t> (1, m_homa->GetBdp ()));
-          auto senderBudgetIt = m_sirdSenderBudgetHostPkts.find (senderKey);
-          if (senderBudgetIt != m_sirdSenderBudgetHostPkts.end ())
-          {
-            senderBudgetHostPkts = senderBudgetIt->second;
-          }
-
           const uint32_t globalBudgetPkts = std::max<uint32_t> (1, m_homa->GetSirdCreditBudgetPkts ());
           m_homa->TraceSirdBucketState (ipv4Header.GetDestination (),
                                         Ipv4Address (senderKey),
-                                        senderBudgetHostPkts,
+                                        hostBudgetPkts,
                                         inUseIt->second,
                                         m_sirdGlobalCreditsInUsePkts,
                                         globalBudgetPkts,
                                         2);
         }
       }//credit 归还
+
+      const uint64_t epochPkts = std::max<uint16_t> (1, m_homa->GetBdp ());
+      uint64_t epochDataPkts = m_sirdSenderEpochDataPkts[senderKey];
+      if (epochDataPkts >= epochPkts)
+      {
+        double ceFraction = static_cast<double> (m_sirdSenderEpochCeMarks[senderKey]) /
+                            static_cast<double> (epochDataPkts);
+        double csnFraction = static_cast<double> (m_sirdSenderEpochCsnMarks[senderKey]) /
+                             static_cast<double> (epochDataPkts);
+
+        double netAlpha = m_sirdSenderNetAlpha[senderKey];
+        netAlpha = (1.0 - alpha) * netAlpha + alpha * ceFraction;
+        m_sirdSenderNetAlpha[senderKey] = netAlpha;
+
+        double hostAlpha = m_sirdSenderHostAlpha[senderKey];
+        hostAlpha = (1.0 - alpha) * hostAlpha + alpha * csnFraction;
+        m_sirdSenderHostAlpha[senderKey] = hostAlpha;
+
+        if (m_sirdSenderEpochCeMarks[senderKey] > 0)
+        {
+          netBudgetPkts = clampBudget (netBudgetPkts * (1.0 - netAlpha / 2.0));
+        }
+        else
+        {
+          netBudgetPkts = clampBudget (netBudgetPkts + 1.0);
+        }
+        m_sirdSenderBudgetNetPkts[senderKey] = netBudgetPkts;
+
+        if (m_sirdSenderEpochCsnMarks[senderKey] > 0)
+        {
+          hostBudgetPkts = clampBudget (hostBudgetPkts * (1.0 - hostAlpha / 2.0));
+        }
+        else
+        {
+          hostBudgetPkts = clampBudget (hostBudgetPkts + 1.0);
+        }
+        m_sirdSenderBudgetHostPkts[senderKey] = hostBudgetPkts;
+
+        const uint32_t globalBudgetPkts = std::max<uint32_t> (1, m_homa->GetSirdCreditBudgetPkts ());
+        double effectiveBudgetPkts = std::min (netBudgetPkts, hostBudgetPkts);
+        uint32_t senderCreditsInUsePkts = 0;
+        auto inUseIt = m_sirdSenderCreditsInUsePkts.find (senderKey);
+        if (inUseIt != m_sirdSenderCreditsInUsePkts.end ())
+        {
+          senderCreditsInUsePkts = inUseIt->second;
+        }
+        uint64_t loopState =
+          (static_cast<uint64_t> (ceMarked ? 1 : 0)) |
+          (static_cast<uint64_t> (senderCsn ? 1 : 0) << 1) |
+          (static_cast<uint64_t> (3u) << 2) |
+          (static_cast<uint64_t> (std::min<uint32_t> (senderCreditsInUsePkts, 0xFFFFu)) << 8) |
+          (static_cast<uint64_t> (std::min<uint32_t> (m_sirdGlobalCreditsInUsePkts, 0xFFFFu)) << 24) |
+          (static_cast<uint64_t> (std::min<uint32_t> (globalBudgetPkts, 0xFFFFu)) << 40);
+        uint64_t counterState =
+          (static_cast<uint64_t> (std::min<uint64_t> (m_sirdSenderCeMarksObserved[senderKey], 0x1FFFFFu))) |
+          (static_cast<uint64_t> (std::min<uint64_t> (m_sirdSenderCsnMarksObserved[senderKey], 0x1FFFFFu)) << 21) |
+          (static_cast<uint64_t> (std::min<uint64_t> (m_sirdSenderDataPktsObserved[senderKey], 0x1FFFFFu)) << 42);
+        m_homa->TraceSirdLoopState (ipv4Header.GetDestination (),
+                                    Ipv4Address (senderKey),
+                                    netBudgetPkts,
+                                    hostBudgetPkts,
+                                    effectiveBudgetPkts,
+                                    netAlpha,
+                                    loopState,
+                                    counterState);
+
+        m_sirdSenderEpochDataPkts[senderKey] = 0;
+        m_sirdSenderEpochCeMarks[senderKey] = 0;
+        m_sirdSenderEpochCsnMarks[senderKey] = 0;
+      }
     }
 
     this->ReceiveDataPacket (packet, ipv4Header, homaHeader, interface);
@@ -2627,12 +2747,7 @@ bool HomaRecvScheduler::SendAppropriateGrants()
   std::unordered_set<uint32_t> grantedSenders;
   uint8_t grantingPrio = m_homa->GetNumUnschedPrioBands ();
   uint8_t overcommitDue = m_homa->GetOvercommitLevel ();
-  const double baseBudget = static_cast<double> (std::max<uint16_t> (1, m_homa->GetBdp ()));
   const uint32_t globalBudgetPkts = std::max<uint32_t> (1, m_homa->GetSirdCreditBudgetPkts ());
-
-  auto clampBudget = [baseBudget](double budget) {
-    return std::max (1.0, std::min (baseBudget, budget));
-  };
     
   Ptr<HomaInboundMsg> currentMsg;
   for (std::size_t i = 0; i < m_inboundMsgs.size(); ++i)
@@ -2651,32 +2766,12 @@ bool HomaRecvScheduler::SendAppropriateGrants()
       {
         if (m_busySenders.find(senderKey) == m_busySenders.end())
         {
-          if (m_sirdSenderBudgetNetPkts.find (senderKey) == m_sirdSenderBudgetNetPkts.end ())
+          double netBudget = static_cast<double> (std::max<uint16_t> (1, m_homa->GetBdp ()));
+          auto netBudgetIt = m_sirdSenderBudgetNetPkts.find (senderKey);
+          if (netBudgetIt != m_sirdSenderBudgetNetPkts.end ())
           {
-            m_sirdSenderBudgetNetPkts[senderKey] = baseBudget;
+            netBudget = netBudgetIt->second;
           }
-          if (m_sirdSenderBudgetHostPkts.find (senderKey) == m_sirdSenderBudgetHostPkts.end ())
-          {
-            m_sirdSenderBudgetHostPkts[senderKey] = baseBudget;
-          }
-
-          double netBudget = m_sirdSenderBudgetNetPkts[senderKey];
-          bool senderCe = false;
-          auto ceIt = m_sirdSenderCeState.find (senderKey);
-          if (ceIt != m_sirdSenderCeState.end ())
-          {
-            senderCe = ceIt->second;
-          }
-          if (senderCe)
-          {
-            netBudget = clampBudget (netBudget * m_homa->GetSirdEcnMdFactor ());
-          }
-          else
-          {
-            netBudget = clampBudget (netBudget + m_homa->GetSirdEcnAiStep ());
-          }
-          m_sirdSenderBudgetNetPkts[senderKey] = netBudget;
-
           bool senderCsn = false;
           auto csnIt = m_sirdSenderCsnState.find (senderKey);
           if (csnIt != m_sirdSenderCsnState.end ())
@@ -2684,16 +2779,12 @@ bool HomaRecvScheduler::SendAppropriateGrants()
             senderCsn = csnIt->second;
           }
 
-          double hostBudget = m_sirdSenderBudgetHostPkts[senderKey];
-          if (senderCsn)
+          double hostBudget = static_cast<double> (std::max<uint16_t> (1, m_homa->GetBdp ()));
+          auto hostBudgetIt = m_sirdSenderBudgetHostPkts.find (senderKey);
+          if (hostBudgetIt != m_sirdSenderBudgetHostPkts.end ())
           {
-            hostBudget = clampBudget (hostBudget * m_homa->GetSirdSenderMdFactor ());
+            hostBudget = hostBudgetIt->second;
           }
-          else
-          {
-            hostBudget = clampBudget (hostBudget + m_homa->GetSirdSenderAiStep ());
-          }
-          m_sirdSenderBudgetHostPkts[senderKey] = hostBudget;
 
           double budget = std::min (netBudget, hostBudget);
 

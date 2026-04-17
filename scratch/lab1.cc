@@ -133,6 +133,46 @@ TraceSirdCreditDecision (Ptr<OutputStreamWrapper> stream,
 }
 
 static void
+TraceSirdLoopState (Ptr<OutputStreamWrapper> stream,
+                    Ipv4Address receiver,
+                    Ipv4Address sender,
+                    double netBudgetPkts,
+                    double hostBudgetPkts,
+                    double effectiveBudgetPkts,
+                    double ceEwma,
+                    uint64_t loopState,
+                    uint64_t counterState)
+{
+  bool senderCe = (loopState & 0x1u) != 0;
+  bool senderCsn = (loopState & 0x2u) != 0;
+  uint32_t eventType = static_cast<uint32_t> ((loopState >> 2) & 0x3u);
+  uint32_t senderCreditsInUsePkts = static_cast<uint32_t> ((loopState >> 8) & 0xFFFFu);
+  uint32_t globalCreditsInUsePkts = static_cast<uint32_t> ((loopState >> 24) & 0xFFFFu);
+  uint32_t globalBudgetPkts = static_cast<uint32_t> ((loopState >> 40) & 0xFFFFu);
+  uint64_t ceMarksObserved = counterState & 0x1FFFFFu;
+  uint64_t csnMarksObserved = (counterState >> 21) & 0x1FFFFFu;
+  uint64_t dataPktsObserved = (counterState >> 42) & 0x1FFFFFu;
+
+  *stream->GetStream () << Simulator::Now ().GetNanoSeconds ()
+                        << " receiver=" << receiver
+                        << " sender=" << sender
+                        << " netBudgetPkts=" << netBudgetPkts
+                        << " hostBudgetPkts=" << hostBudgetPkts
+                        << " effectiveBudgetPkts=" << effectiveBudgetPkts
+                        << " senderCe=" << (senderCe ? 1 : 0)
+                        << " senderCsn=" << (senderCsn ? 1 : 0)
+                        << " ceEwma=" << ceEwma
+                        << " senderCreditsInUsePkts=" << senderCreditsInUsePkts
+                        << " globalCreditsInUsePkts=" << globalCreditsInUsePkts
+                        << " globalBudgetPkts=" << globalBudgetPkts
+                        << " ceMarksObserved=" << ceMarksObserved
+                        << " csnMarksObserved=" << csnMarksObserved
+                        << " dataPktsObserved=" << dataPktsObserved
+                        << " eventType=" << eventType
+                        << std::endl;
+}
+
+static void
 TraceLinkThroughput (Ptr<OutputStreamWrapper> stream, Time sampleInterval)
 {
   for (const auto& kv : g_linkRxBytesTotal)
@@ -297,6 +337,9 @@ main (int argc, char* argv[])
   // 是否记录 SIRD credit/GRANT 决策。
   bool traceSirdCredit = true;
 
+  // 是否记录每个 sender 的 SIRD CE/CSN 控制环状态。
+  bool traceSirdLoop = false;
+
   // 是否在终端显示仿真进度条。
   bool showProgressBar = true;
 
@@ -352,6 +395,7 @@ main (int argc, char* argv[])
   cmd.AddValue ("switchQueueSampleUs", "Switch egress queue sampling interval in microseconds", switchQueueSampleUs);
   cmd.AddValue ("traceLinkThroughput", "Whether to trace per-link throughput over time", traceLinkThroughput);
   cmd.AddValue ("traceSirdCredit", "Whether to trace SIRD credit/GRANT decisions", traceSirdCredit);
+  cmd.AddValue ("traceSirdLoop", "Whether to trace per-sender SIRD loop state", traceSirdLoop);
   cmd.AddValue ("showProgressBar", "Whether to display simulation progress bar in terminal", showProgressBar);
   cmd.AddValue ("progressIntervalMs", "Progress bar refresh interval in milliseconds", progressIntervalMs);
   cmd.AddValue ("bdpPkts", "One-way path BDP in packets; all SIRD/Homa thresholds are derived from it", bdpPkts);
@@ -472,6 +516,13 @@ main (int argc, char* argv[])
       Ptr<OutputStreamWrapper> sirdCreditStream = ascii.CreateFileStream (prefix.str () + ".sird-credit.tr");
       Config::ConnectWithoutContext ("/NodeList/*/$ns3::HomaL4Protocol/SirdGrantDecision",
                                      MakeBoundCallback (&TraceSirdCreditDecision, sirdCreditStream));
+    }
+
+  if (enableSird && traceSirdLoop)
+    {
+      Ptr<OutputStreamWrapper> sirdLoopStream = ascii.CreateFileStream (prefix.str () + ".sird-loop.tr");
+      Config::ConnectWithoutContext ("/NodeList/*/$ns3::HomaL4Protocol/SirdLoopState",
+                                     MakeBoundCallback (&TraceSirdLoopState, sirdLoopStream));
     }
 
   std::vector<SwitchEgressQueueTarget> switchEgressQueueTargets;
