@@ -10,6 +10,8 @@
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
+#include <limits>
+#include <queue>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -27,12 +29,20 @@
 
 using namespace ns3;
 
-NS_LOG_COMPONENT_DEFINE ("HomaL4ProtocolLab1ReceiverCongestion");
+NS_LOG_COMPONENT_DEFINE ("HomaL4ProtocolLab1ReceiverCongestionLongRtt");
 
 static std::unordered_map<std::string, uint64_t> g_linkRxBytesTotal;
 static std::unordered_map<std::string, uint64_t> g_linkRxBytesLastSample;
 static bool g_progressBarCompleted = false;
 static const double kLinkThroughputSampleSec = 0.001;
+static Ptr<OutputStreamWrapper> g_appLatencyStream;
+static std::queue<uint32_t> g_probeRequestIds;
+static uint32_t g_nextProbeRequestId = 0;
+static Ipv4Address g_probeClientIp;
+static Ipv4Address g_probeServerIp;
+static uint16_t g_probeClientPort = 21000;
+static uint16_t g_probeServerPort = 30000;
+static uint32_t g_probeRequestSizeBytes = 0;
 
 struct SwitchEgressQueueTarget
 {
@@ -47,6 +57,80 @@ AppReceive (Ptr<Socket> receiverSocket)
   while (receiverSocket->RecvFrom (from))
     {
       // Drain receive queue.
+    }
+}
+
+static void
+TraceProbeLatencyBegin (uint32_t probeId)
+{
+  if (g_appLatencyStream == 0)
+    {
+      return;
+    }
+
+  *g_appLatencyStream->GetStream () << "+ " << Simulator::Now ().GetNanoSeconds ()
+                                    << " " << g_probeRequestSizeBytes
+                                    << " " << g_probeClientIp << ":" << g_probeClientPort
+                                    << " " << g_probeServerIp << ":" << g_probeServerPort
+                                    << " " << probeId << std::endl;
+}
+
+static void
+TraceProbeLatencyFinish (uint32_t probeId)
+{
+  if (g_appLatencyStream == 0)
+    {
+      return;
+    }
+
+  *g_appLatencyStream->GetStream () << "- " << Simulator::Now ().GetNanoSeconds ()
+                                    << " " << g_probeRequestSizeBytes
+                                    << " " << g_probeClientIp << ":" << g_probeClientPort
+                                    << " " << g_probeServerIp << ":" << g_probeServerPort
+                                    << " " << probeId << std::endl;
+}
+
+static void
+ProbeReplyReceive (Ptr<Socket> probeSocket)
+{
+  Address from;
+  while (probeSocket->RecvFrom (std::numeric_limits<uint32_t>::max (), 0, from))
+    {
+      if (g_probeRequestIds.empty ())
+        {
+          NS_LOG_WARN ("Probe client received a reply without a pending request id.");
+          continue;
+        }
+
+      uint32_t probeId = g_probeRequestIds.front ();
+      g_probeRequestIds.pop ();
+      TraceProbeLatencyFinish (probeId);
+    }
+}
+
+static void
+ServerReceiveAndReply (uint32_t replySizeBytes, Ptr<Socket> receiverSocket)
+{
+  Address from;
+  while (Ptr<Packet> request = receiverSocket->RecvFrom (std::numeric_limits<uint32_t>::max (), 0, from))
+    {
+      if (!InetSocketAddress::IsMatchingType (from))
+        {
+          continue;
+        }
+
+      InetSocketAddress peer = InetSocketAddress::ConvertFrom (from);
+      if (peer.GetPort () != g_probeClientPort ||
+          request->GetSize () != g_probeRequestSizeBytes)
+        {
+          continue;
+        }
+
+      int sent = receiverSocket->SendTo (Create<Packet> (replySizeBytes), 0, from);
+      NS_ABORT_MSG_IF (sent <= 0 || static_cast<uint32_t> (sent) != replySizeBytes,
+                       "Failed to send minimal probe reply of size " << replySizeBytes
+                                                                     << " bytes; sent "
+                                                                     << sent);
     }
 }
 
@@ -259,6 +343,39 @@ TraceSimulationProgress (Time stopTime, Time progressInterval)
 }
 
 static void
+SendProbeRequest (Ptr<Socket> socket,
+                  InetSocketAddress dst,
+                  uint32_t msgSizeBytes,
+                  Time interval,
+                  Time stopTime,
+                  uint32_t remainingMessages)
+{
+  if (Simulator::Now () >= stopTime || remainingMessages == 0)
+    {
+      return;
+    }
+
+  uint32_t probeId = g_nextProbeRequestId++;
+  int sent = socket->SendTo (Create<Packet> (msgSizeBytes), 0, dst);
+  NS_ABORT_MSG_IF (sent <= 0 || static_cast<uint32_t> (sent) != msgSizeBytes,
+                   "Failed to send probe request of size " << msgSizeBytes
+                                                           << " bytes; sent "
+                                                           << sent);
+  g_probeRequestIds.push (probeId);
+  TraceProbeLatencyBegin (probeId);
+
+  uint32_t nextRemainingMessages = remainingMessages == 0xffffffffu ? 0xffffffffu : remainingMessages - 1;
+  Simulator::Schedule (interval,
+                       &SendProbeRequest,
+                       socket,
+                       dst,
+                       msgSizeBytes,
+                       interval,
+                       stopTime,
+                       nextRemainingMessages);
+}
+
+static void
 SendPeriodic (Ptr<Socket> socket,
               InetSocketAddress dst,
               uint32_t msgSizeBytes,
@@ -325,8 +442,14 @@ main (int argc, char* argv[])
   // 是否使用 SRR/FIFO-like receiver scheduling；false 表示默认 SRPT。
   bool useSrrScheduling = false;
 
-  // 是否记录消息开始/完成事件；FCT 分析依赖这个 trace。
+  // 是否记录消息开始/完成事件；latency/FCT 分析依赖这个 trace。
   bool traceMsg = true;
+
+  // 按原文口径测量 client-observed request/reply latency，而不是单向 request FCT。
+  bool traceRequestReplyLatency = true;
+
+  // Server 收到完整 request 后返回的 minimal reply 大小。避免 0B DATA 被解释为 credit request。
+  uint32_t replySizeBytes = 8;
 
   // 是否记录由 Homa 内部收发事件还原的 path RTT；不额外注入 ICMP 探针包。
   bool tracePathRtt = true;
@@ -352,9 +475,9 @@ main (int argc, char* argv[])
   // 进度条刷新周期，单位毫秒。
   double progressIntervalMs = 1.0;
 
-  // RTT BDP，单位为包。100Gbps、约 2us 单向路径、约 1500B/packet 时单向约 16.66pkts，
-  // 往返约 33.32pkts；Homa/SIRD 的 BDP 派生阈值统一使用这个 RTT BDP。
-  double bdpPkts = 33.32;
+  // RTT BDP，单位为包。100Gbps、4.5us 单链路、两跳单向路径时 RTT 约 18us；
+  // 以 1500B/packet 估算约 150pkts。Homa/SIRD 的阈值统一由该值派生。
+  double bdpPkts = 150.0;
 
   // Homa 可用的总优先级队列数量。
   uint8_t numTotalPrioBands = 8;
@@ -398,6 +521,8 @@ main (int argc, char* argv[])
   cmd.AddValue ("enableBackgroundTraffic", "Whether to generate the 6 long background senders", enableBackgroundTraffic);
   cmd.AddValue ("useSrrScheduling", "Use FIFO/SRR-like receiver scheduling instead of SRPT", useSrrScheduling);
   cmd.AddValue ("traceMsg", "Whether to trace message begin/finish events", traceMsg);
+  cmd.AddValue ("traceRequestReplyLatency", "Trace probe request/reply latency at the client application", traceRequestReplyLatency);
+  cmd.AddValue ("replySizeBytes", "Minimal reply size for request/reply latency mode", replySizeBytes);
   cmd.AddValue ("tracePathRtt", "Whether to trace Homa-derived path RTT", tracePathRtt);
   cmd.AddValue ("traceSwitchEgressQueue", "Whether to sample switch egress queue occupancy", traceSwitchEgressQueue);
   cmd.AddValue ("switchQueueSampleUs", "Switch egress queue sampling interval in microseconds", switchQueueSampleUs);
@@ -457,7 +582,7 @@ main (int argc, char* argv[])
 
   PointToPointHelper p2p;
   p2p.SetDeviceAttribute ("DataRate", StringValue ("100Gbps"));
-  p2p.SetChannelAttribute ("Delay", StringValue ("1us"));
+  p2p.SetChannelAttribute ("Delay", StringValue ("4.5us"));
   p2p.SetQueue ("ns3::DropTailQueue", "MaxSize", StringValue (deviceQueueMaxSize));
 
   std::vector<NetDeviceContainer> links;
@@ -506,10 +631,17 @@ main (int argc, char* argv[])
   if (traceMsg)
     {
       Ptr<OutputStreamWrapper> msgStream = ascii.CreateFileStream (prefix.str () + ".msg.tr");
-      Config::ConnectWithoutContext ("/NodeList/*/$ns3::HomaL4Protocol/MsgBegin",
-                                     MakeBoundCallback (&TraceMsgBegin, msgStream));
-      Config::ConnectWithoutContext ("/NodeList/*/$ns3::HomaL4Protocol/MsgFinish",
-                                     MakeBoundCallback (&TraceMsgFinish, msgStream));
+      if (traceRequestReplyLatency)
+        {
+          g_appLatencyStream = msgStream;
+        }
+      else
+        {
+          Config::ConnectWithoutContext ("/NodeList/*/$ns3::HomaL4Protocol/MsgBegin",
+                                         MakeBoundCallback (&TraceMsgBegin, msgStream));
+          Config::ConnectWithoutContext ("/NodeList/*/$ns3::HomaL4Protocol/MsgFinish",
+                                         MakeBoundCallback (&TraceMsgFinish, msgStream));
+        }
     }
 
   if (tracePathRtt)
@@ -600,7 +732,20 @@ main (int argc, char* argv[])
   Ptr<Socket> receiverSock = rFactory->CreateSocket ();
   InetSocketAddress receiverAddr (hostIps[receiverIdx], 30000);
   receiverSock->Bind (receiverAddr);
-  receiverSock->SetRecvCallback (MakeCallback (&AppReceive));
+
+  g_probeClientIp = hostIps[probeSenderIdx];
+  g_probeServerIp = hostIps[receiverIdx];
+  g_probeRequestSizeBytes = shortMsgSizeBytes;
+
+  if (traceRequestReplyLatency)
+    {
+      receiverSock->SetRecvCallback (MakeBoundCallback (&ServerReceiveAndReply,
+                                                        replySizeBytes));
+    }
+  else
+    {
+      receiverSock->SetRecvCallback (MakeCallback (&AppReceive));
+    }
 
   Time longInterval = Seconds ((static_cast<double> (longMsgSizeBytes) * 8.0) /
                                (longSenderRateGbps * 1e9));
@@ -627,14 +772,29 @@ main (int argc, char* argv[])
   Ptr<SocketFactory> probeFactory = hosts.Get (probeSenderIdx)->GetObject<HomaSocketFactory> ();
   Ptr<Socket> probeSock = probeFactory->CreateSocket ();
   probeSock->Bind (InetSocketAddress (hostIps[probeSenderIdx], 21000));
-  Simulator::Schedule (startTime,
-                       &SendPeriodic,
-                       probeSock,
-                       receiverAddr,
-                       shortMsgSizeBytes,
-                       shortInterval,
-                       stopTime,
-                       targetProbeMessages == 0 ? 0xffffffffu : targetProbeMessages);
+  if (traceRequestReplyLatency)
+    {
+      probeSock->SetRecvCallback (MakeCallback (&ProbeReplyReceive));
+      Simulator::Schedule (startTime,
+                           &SendProbeRequest,
+                           probeSock,
+                           receiverAddr,
+                           shortMsgSizeBytes,
+                           shortInterval,
+                           stopTime,
+                           targetProbeMessages == 0 ? 0xffffffffu : targetProbeMessages);
+    }
+  else
+    {
+      Simulator::Schedule (startTime,
+                           &SendPeriodic,
+                           probeSock,
+                           receiverAddr,
+                           shortMsgSizeBytes,
+                           shortInterval,
+                           stopTime,
+                           targetProbeMessages == 0 ? 0xffffffffu : targetProbeMessages);
+    }
 
   Simulator::Stop (simStopTime);
   Time progressInterval = MilliSeconds (std::max (1.0, progressIntervalMs));

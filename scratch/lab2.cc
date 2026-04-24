@@ -341,7 +341,7 @@ main (int argc, char* argv[])
   uint64_t creditSampleUs = 1000;
   uint64_t switchQueueSampleUs = 1000;
 
-  uint32_t rttPkts = 24;
+  uint32_t homaBdpPkts = 24;
   uint8_t numTotalPrioBands = 8;
   uint8_t numUnschedPrioBands = 2;
 
@@ -375,7 +375,7 @@ main (int argc, char* argv[])
   cmd.AddValue ("traceSwitchEgressQueue", "Whether to sample switch egress queue occupancy", traceSwitchEgressQueue);
   cmd.AddValue ("creditSampleUs", "Compact credit series sampling period in microseconds", creditSampleUs);
   cmd.AddValue ("switchQueueSampleUs", "Switch egress queue sampling interval in microseconds", switchQueueSampleUs);
-  cmd.AddValue ("rttPkts", "Homa RTT packets (BDP approximation)", rttPkts);
+  cmd.AddValue ("rttPkts", "RTT BDP in packets passed to HomaL4Protocol::RttPackets", homaBdpPkts);
   cmd.AddValue ("sirdCreditBudgetPkts", "SIRD global credit budget in packets", sirdCreditBudgetPkts);
   cmd.AddValue ("sirdUnschThresholdPkts", "SIRD unscheduled threshold in packets", sirdUnschThresholdPkts);
   cmd.AddValue ("sirdEcnMdFactor", "SIRD ECN multiplicative decrease factor", sirdEcnMdFactor);
@@ -393,7 +393,7 @@ main (int argc, char* argv[])
   SeedManager::SetRun (1);
 
   Config::SetDefault ("ns3::Ipv4GlobalRouting::EcmpMode", EnumValue (Ipv4GlobalRouting::ECMP_RANDOM));
-  Config::SetDefault ("ns3::HomaL4Protocol::RttPackets", UintegerValue (rttPkts));
+  Config::SetDefault ("ns3::HomaL4Protocol::RttPackets", UintegerValue (homaBdpPkts));
   Config::SetDefault ("ns3::HomaL4Protocol::NumTotalPrioBands", UintegerValue (numTotalPrioBands));
   Config::SetDefault ("ns3::HomaL4Protocol::NumUnschedPrioBands", UintegerValue (numUnschedPrioBands));
   Config::SetDefault ("ns3::HomaL4Protocol::UseSrrScheduling", BooleanValue (false));
@@ -406,7 +406,7 @@ main (int argc, char* argv[])
   Config::SetDefault ("ns3::HomaL4Protocol::SirdSenderAiStep", DoubleValue (sirdSenderAiStep));
   Config::SetDefault ("ns3::HomaL4Protocol::SirdEcnAlphaGain", DoubleValue (sirdEcnAlphaGain));
   Config::SetDefault ("ns3::HomaL4Protocol::SirdSenderCsnThreshold", UintegerValue (sirdSenderCsnThresholdPkts));
-  g_bdpPkts = rttPkts;
+  g_bdpPkts = homaBdpPkts;
   g_creditBudgetPkts = sirdCreditBudgetPkts;
 
   const uint32_t senderIdx = 0;

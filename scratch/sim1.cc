@@ -241,7 +241,7 @@ main (int argc, char* argv[])
   std::string torSpineDelay = "1us";
 
   uint32_t appPort = 30000;
-  uint32_t rttPkts = 24;
+  uint32_t homaBdpPkts = 24;
   uint16_t sirdCreditBudgetPkts = 36;
   uint16_t sirdUnschThresholdPkts = 24;
   double sirdEcnMdFactor = 0.85;
@@ -289,7 +289,7 @@ main (int argc, char* argv[])
   cmd.AddValue ("incastLoadFraction", "Aggregate incast overlay load fraction relative to total background offered load", incastLoadFraction);
   cmd.AddValue ("incastReceiverIdx", "Receiver host index for incast; negative chooses random receiver", incastReceiverIdx);
   cmd.AddValue ("incastSeed", "Seed for deterministic incast sender/receiver selection", incastSeed);
-  cmd.AddValue ("rttPkts", "Homa RTT packets (BDP approximation)", rttPkts);
+  cmd.AddValue ("rttPkts", "RTT BDP in packets passed to HomaL4Protocol::RttPackets", homaBdpPkts);
   cmd.AddValue ("sirdCreditBudgetPkts", "SIRD global credit budget in packets", sirdCreditBudgetPkts);
   cmd.AddValue ("sirdUnschThresholdPkts", "SIRD unscheduled threshold in packets", sirdUnschThresholdPkts);
   cmd.AddValue ("sirdEcnMdFactor", "SIRD ECN multiplicative decrease factor", sirdEcnMdFactor);
@@ -356,7 +356,7 @@ main (int argc, char* argv[])
   SeedManager::SetRun (1);
 
   Config::SetDefault ("ns3::Ipv4GlobalRouting::EcmpMode", EnumValue (Ipv4GlobalRouting::ECMP_RANDOM));
-  Config::SetDefault ("ns3::HomaL4Protocol::RttPackets", UintegerValue (rttPkts));
+  Config::SetDefault ("ns3::HomaL4Protocol::RttPackets", UintegerValue (homaBdpPkts));
   Config::SetDefault ("ns3::HomaL4Protocol::NumTotalPrioBands", UintegerValue (8));
   Config::SetDefault ("ns3::HomaL4Protocol::NumUnschedPrioBands", UintegerValue (2));
   Config::SetDefault ("ns3::HomaL4Protocol::SirdEnabled", BooleanValue (enableSird));

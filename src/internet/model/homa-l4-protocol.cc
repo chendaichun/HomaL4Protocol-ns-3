@@ -128,7 +128,7 @@ HomaL4Protocol::GetTypeId (void)
                    ObjectVectorValue (),
                    MakeObjectVectorAccessor (&HomaL4Protocol::m_sockets),
                    MakeObjectVectorChecker<HomaSocket> ())
-    .AddAttribute ("RttPackets", "The number of packets required for full utilization, ie. BDP.",
+    .AddAttribute ("RttPackets", "RTT BDP in packets for Homa's in-flight window baseline.",
                    UintegerValue (10),
                    MakeUintegerAccessor (&HomaL4Protocol::m_bdp),
                    MakeUintegerChecker<uint16_t> ())
@@ -1887,6 +1887,7 @@ HomaInboundMsg::HomaInboundMsg (Ptr<Packet> p,
                                 bool sirdEnabled, uint16_t sirdUnschThresholdPkts)
     : m_prio(0),
       m_hasGrantedData(false),
+      m_creditDrivenGrantWindow(false),
       m_currentlyScheduled(false),
       m_numRtxWithoutProgress (0)
 {
@@ -1935,6 +1936,7 @@ HomaInboundMsg::HomaInboundMsg (Ptr<Packet> p,
     m_maxGrantedIdx = 0;
     m_maxGrantableIdx = 0;
     m_hasGrantedData = false;
+    m_creditDrivenGrantWindow = true;
   }
   else
   {
@@ -2157,10 +2159,12 @@ void HomaInboundMsg::ReceiveDataPacket (Ptr<Packet> p, uint16_t pktOffset)
      * is upto the HomaRecvScheduler to decide whether to send a Grant packet 
      * to the sender of this message or not.
      */
-    if (m_maxGrantableIdx < m_msgSizePkts - 1)
+    if (m_creditDrivenGrantWindow || m_maxGrantableIdx >= m_msgSizePkts - 1)
     {
-      m_maxGrantableIdx++;
+      return;
     }
+
+    m_maxGrantableIdx++;
   }
   else
   {
@@ -2170,7 +2174,7 @@ void HomaInboundMsg::ReceiveDataPacket (Ptr<Packet> p, uint16_t pktOffset)
     // TODO: Insert a trace source to keep track of spurious retransmissions.
   }
 }
-    
+
 // 在消息完整后执行重组，返回可直接上交应用层的完整 Packet。
 Ptr<Packet> HomaInboundMsg::GetReassembledMsg ()
 {

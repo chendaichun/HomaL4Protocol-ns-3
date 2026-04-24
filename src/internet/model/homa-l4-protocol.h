@@ -468,7 +468,7 @@ private:
   bool m_memIsOptimized; //!< High performant mode (only packet sizes are stored to save from memory)
   
   uint32_t m_mtu; //!< The MTU of the bounded NetDevice
-  uint16_t m_bdp; //!< The number of packets required for full utilization, ie. BDP.
+  uint16_t m_bdp; //!< RTT BDP in packets for Homa's in-flight window baseline.
     
   uint8_t m_numTotalPrioBands;   //!< Total number of priority levels used within the network
   uint8_t m_numUnschedPrioBands; //!< Number of priority bands dedicated for unscheduled packets
@@ -976,6 +976,7 @@ private:
   uint16_t m_maxGrantedIdx;  //!< Highest Grant Offset sent so far
   uint8_t m_prio;            //!< The most recent granted priority set for this message
   bool m_hasGrantedData;     //!< Whether at least one real DATA packet has been granted
+  bool m_creditDrivenGrantWindow; //!< Whether SIRD credit bucket is the only grant-window source
   bool m_currentlyScheduled; //!< Whether this message is prioritized enough to be actively granted
   
   EventId m_rtxEvent;        //!< The EventID for the retransmission timeout
