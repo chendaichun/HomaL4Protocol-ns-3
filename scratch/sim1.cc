@@ -11,6 +11,7 @@
  */
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
@@ -170,7 +171,7 @@ SendPeriodic (Ptr<Socket> socket,
 }
 
 static WorkloadSpec
-ReadWorkloadFile (const std::string& path)
+ReadWorkloadFile (const std::string& path, uint32_t payloadSizeBytes)
 {
   std::ifstream in (path.c_str ());
   if (!in.is_open ())
@@ -179,7 +180,55 @@ ReadWorkloadFile (const std::string& path)
     }
 
   WorkloadSpec spec;
-  if (!(in >> spec.avgMsgSizePkts))
+  std::string firstLine;
+  if (!std::getline (in, firstLine))
+    {
+      throw std::runtime_error ("Empty workload file: " + path);
+    }
+
+  auto toPkts = [payloadSizeBytes](double bytes) {
+    return std::max<int> (1, static_cast<int> (std::ceil (bytes / payloadSizeBytes)));
+  };
+
+  if (firstLine.find ("description,") == 0)
+    {
+      std::string line;
+      if (!std::getline (in, line) || line.find ("mean_header,") != 0)
+        {
+          throw std::runtime_error ("Invalid CSV workload mean header in: " + path);
+        }
+      spec.avgMsgSizePkts = std::stod (line.substr (line.find (',') + 1)) / payloadSizeBytes;
+
+      if (!std::getline (in, line) || line.find ("size_bytes_or_units,cdf") != 0)
+        {
+          throw std::runtime_error ("Invalid CSV workload CDF header in: " + path);
+        }
+
+      while (std::getline (in, line))
+        {
+          if (line.empty ())
+            {
+              continue;
+            }
+          std::size_t comma = line.find (',');
+          if (comma == std::string::npos)
+            {
+              throw std::runtime_error ("Invalid CSV workload entry in: " + path);
+            }
+          double sizeBytes = std::stod (line.substr (0, comma));
+          double cumulativeProbability = std::stod (line.substr (comma + 1));
+          spec.msgSizeCdf[cumulativeProbability] = toPkts (sizeBytes);
+        }
+
+      if (spec.msgSizeCdf.empty ())
+        {
+          throw std::runtime_error ("No CDF entries found in workload file: " + path);
+        }
+      return spec;
+    }
+
+  std::istringstream firstLineStream (firstLine);
+  if (!(firstLineStream >> spec.avgMsgSizePkts))
     {
       throw std::runtime_error ("Invalid workload header in: " + path);
     }
@@ -241,19 +290,21 @@ main (int argc, char* argv[])
   std::string torSpineDelay = "1us";
 
   uint32_t appPort = 30000;
-  uint32_t homaBdpPkts = 24;
-  uint16_t sirdCreditBudgetPkts = 36;
-  uint16_t sirdUnschThresholdPkts = 24;
+  uint32_t bdpBytes = 100000;
+  uint32_t payloadSizeBytes = 1442;
+  int32_t homaBdpPkts = -1;
+  int32_t sirdCreditBudgetPkts = -1;
+  int32_t sirdUnschThresholdPkts = -1;
   double sirdEcnMdFactor = 0.85;
   double sirdEcnAiStep = 1.0;
   double sirdSenderMdFactor = 0.8;
   double sirdSenderAiStep = 1.0;
   double sirdEcnAlphaGain = 0.125;
-  uint16_t sirdSenderCsnThresholdPkts = 12;
+  int32_t sirdSenderCsnThresholdPkts = -1;
 
   std::string deviceQueueMaxSize = "2000p";
   std::string qdiscMaxSize = "1000p";
-  std::string qdiscMarkThreshold = "120p";
+  std::string qdiscMarkThreshold = "";
 
   bool traceMsg = true;
   bool traceTorQueue = true;
@@ -289,15 +340,17 @@ main (int argc, char* argv[])
   cmd.AddValue ("incastLoadFraction", "Aggregate incast overlay load fraction relative to total background offered load", incastLoadFraction);
   cmd.AddValue ("incastReceiverIdx", "Receiver host index for incast; negative chooses random receiver", incastReceiverIdx);
   cmd.AddValue ("incastSeed", "Seed for deterministic incast sender/receiver selection", incastSeed);
-  cmd.AddValue ("rttPkts", "RTT BDP in packets passed to HomaL4Protocol::RttPackets", homaBdpPkts);
-  cmd.AddValue ("sirdCreditBudgetPkts", "SIRD global credit budget in packets", sirdCreditBudgetPkts);
-  cmd.AddValue ("sirdUnschThresholdPkts", "SIRD unscheduled threshold in packets", sirdUnschThresholdPkts);
+  cmd.AddValue ("bdpBytes", "Paper sim1 RTT BDP in bytes; defaults to 100KB from Table 2", bdpBytes);
+  cmd.AddValue ("payloadSizeBytes", "Payload bytes represented by one workload packet unit", payloadSizeBytes);
+  cmd.AddValue ("rttPkts", "RTT BDP in packets; negative derives from bdpBytes/payloadSizeBytes", homaBdpPkts);
+  cmd.AddValue ("sirdCreditBudgetPkts", "SIRD global credit budget in packets; negative derives as 1.5xBDP", sirdCreditBudgetPkts);
+  cmd.AddValue ("sirdUnschThresholdPkts", "SIRD unscheduled threshold in packets; negative derives as 1.0xBDP", sirdUnschThresholdPkts);
   cmd.AddValue ("sirdEcnMdFactor", "SIRD ECN multiplicative decrease factor", sirdEcnMdFactor);
   cmd.AddValue ("sirdEcnAiStep", "SIRD ECN additive increase step", sirdEcnAiStep);
   cmd.AddValue ("sirdSenderMdFactor", "SIRD sender-feedback multiplicative decrease factor", sirdSenderMdFactor);
   cmd.AddValue ("sirdSenderAiStep", "SIRD sender-feedback additive increase step", sirdSenderAiStep);
   cmd.AddValue ("sirdEcnAlphaGain", "SIRD ECN EWMA gain", sirdEcnAlphaGain);
-  cmd.AddValue ("sirdSenderCsnThresholdPkts", "SIRD sender CSN threshold in packets", sirdSenderCsnThresholdPkts);
+  cmd.AddValue ("sirdSenderCsnThresholdPkts", "SIRD sender CSN threshold in packets; negative derives as 0.5xBDP", sirdSenderCsnThresholdPkts);
   cmd.AddValue ("deviceQueueMaxSize", "PointToPointNetDevice TxQueue MaxSize", deviceQueueMaxSize);
   cmd.AddValue ("qdiscMaxSize", "SirdQueueDisc MaxSize", qdiscMaxSize);
   cmd.AddValue ("qdiscMarkThreshold", "SirdQueueDisc ECN mark threshold", qdiscMarkThreshold);
@@ -314,6 +367,40 @@ main (int argc, char* argv[])
   if (incastLoadFraction < 0.0 || incastLoadFraction >= 1.0)
     {
       NS_FATAL_ERROR ("incastLoadFraction must be in [0, 1).");
+    }
+  if (payloadSizeBytes == 0 || bdpBytes == 0)
+    {
+      NS_FATAL_ERROR ("payloadSizeBytes and bdpBytes must be positive.");
+    }
+
+  const int32_t derivedBdpPkts = std::max<int32_t> (
+    1, static_cast<int32_t> (std::lround (static_cast<double> (bdpBytes) / payloadSizeBytes)));
+  auto derivePktsFromBdpBytes = [bdpBytes, payloadSizeBytes](double multiplier) {
+    return std::max<int32_t> (
+      1, static_cast<int32_t> (
+           std::lround (multiplier * static_cast<double> (bdpBytes) / payloadSizeBytes)));
+  };
+  if (homaBdpPkts < 0)
+    {
+      homaBdpPkts = derivedBdpPkts;
+    }
+  if (sirdCreditBudgetPkts < 0)
+    {
+      sirdCreditBudgetPkts = derivePktsFromBdpBytes (1.5);
+    }
+  if (sirdUnschThresholdPkts < 0)
+    {
+      sirdUnschThresholdPkts = derivePktsFromBdpBytes (1.0);
+    }
+  if (sirdSenderCsnThresholdPkts < 0)
+    {
+      sirdSenderCsnThresholdPkts = derivePktsFromBdpBytes (0.5);
+    }
+  if (qdiscMarkThreshold.empty ())
+    {
+      std::ostringstream threshold;
+      threshold << derivePktsFromBdpBytes (1.25) << "p";
+      qdiscMarkThreshold = threshold.str ();
     }
 
   if (trafficConfig == "balanced")
@@ -345,7 +432,8 @@ main (int argc, char* argv[])
   WorkloadSpec workload;
   try
     {
-      workload = ReadWorkloadFile (ResolveWorkloadPath (workloadName, workloadFile));
+      workload = ReadWorkloadFile (ResolveWorkloadPath (workloadName, workloadFile),
+                                   payloadSizeBytes);
     }
   catch (const std::exception& ex)
     {
@@ -356,18 +444,19 @@ main (int argc, char* argv[])
   SeedManager::SetRun (1);
 
   Config::SetDefault ("ns3::Ipv4GlobalRouting::EcmpMode", EnumValue (Ipv4GlobalRouting::ECMP_RANDOM));
-  Config::SetDefault ("ns3::HomaL4Protocol::RttPackets", UintegerValue (homaBdpPkts));
+  Config::SetDefault ("ns3::MsgGeneratorApp::PayloadSize", UintegerValue (payloadSizeBytes));
+  Config::SetDefault ("ns3::HomaL4Protocol::RttPackets", UintegerValue (static_cast<uint16_t> (homaBdpPkts)));
   Config::SetDefault ("ns3::HomaL4Protocol::NumTotalPrioBands", UintegerValue (8));
   Config::SetDefault ("ns3::HomaL4Protocol::NumUnschedPrioBands", UintegerValue (2));
   Config::SetDefault ("ns3::HomaL4Protocol::SirdEnabled", BooleanValue (enableSird));
-  Config::SetDefault ("ns3::HomaL4Protocol::SirdCreditBudgetPkts", UintegerValue (sirdCreditBudgetPkts));
-  Config::SetDefault ("ns3::HomaL4Protocol::SirdUnschThresholdPkts", UintegerValue (sirdUnschThresholdPkts));
+  Config::SetDefault ("ns3::HomaL4Protocol::SirdCreditBudgetPkts", UintegerValue (static_cast<uint16_t> (sirdCreditBudgetPkts)));
+  Config::SetDefault ("ns3::HomaL4Protocol::SirdUnschThresholdPkts", UintegerValue (static_cast<uint16_t> (sirdUnschThresholdPkts)));
   Config::SetDefault ("ns3::HomaL4Protocol::SirdEcnMdFactor", DoubleValue (sirdEcnMdFactor));
   Config::SetDefault ("ns3::HomaL4Protocol::SirdEcnAiStep", DoubleValue (sirdEcnAiStep));
   Config::SetDefault ("ns3::HomaL4Protocol::SirdSenderMdFactor", DoubleValue (sirdSenderMdFactor));
   Config::SetDefault ("ns3::HomaL4Protocol::SirdSenderAiStep", DoubleValue (sirdSenderAiStep));
   Config::SetDefault ("ns3::HomaL4Protocol::SirdEcnAlphaGain", DoubleValue (sirdEcnAlphaGain));
-  Config::SetDefault ("ns3::HomaL4Protocol::SirdSenderCsnThreshold", UintegerValue (sirdSenderCsnThresholdPkts));
+  Config::SetDefault ("ns3::HomaL4Protocol::SirdSenderCsnThreshold", UintegerValue (static_cast<uint16_t> (sirdSenderCsnThresholdPkts)));
 
   NodeContainer hosts;
   hosts.Create (nHosts);

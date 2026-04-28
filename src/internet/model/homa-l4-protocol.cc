@@ -184,6 +184,11 @@ HomaL4Protocol::GetTypeId (void)
              UintegerValue (20),
              MakeUintegerAccessor (&HomaL4Protocol::m_sirdSenderCsnThreshold),
              MakeUintegerChecker<uint16_t> (0))
+    .AddAttribute ("SirdSenderCreditLaunchDelay",
+             "Sender-side delay between receiving scheduled credit and making that credit eligible to launch DATA.",
+             TimeValue (NanoSeconds (0)),
+             MakeTimeAccessor (&HomaL4Protocol::m_sirdSenderCreditLaunchDelay),
+             MakeTimeChecker (NanoSeconds (0)))
     .AddAttribute ("InbndRtxTimeout", "Time value to determine the retransmission timeout of InboundMsgs",
                    TimeValue (MilliSeconds (1)),
                    MakeTimeAccessor (&HomaL4Protocol::m_inboundRtxTimeout),
@@ -250,6 +255,14 @@ HomaL4Protocol::GetTypeId (void)
     .AddTraceSource ("SirdLoopState",
                      "Trace source for per-sender SIRD control-loop state.",
                      MakeTraceSourceAccessor (&HomaL4Protocol::m_sirdLoopStateTrace),
+                     "ns3::TracedCallback")
+    .AddTraceSource ("SirdSenderCreditState",
+                     "Trace source for sender-side scheduled credit currently held.",
+                     MakeTraceSourceAccessor (&HomaL4Protocol::m_sirdSenderCreditStateTrace),
+                     "ns3::TracedCallback")
+    .AddTraceSource ("SirdReceiverCreditState",
+                     "Trace source for receiver-side available credit after bucket updates.",
+                     MakeTraceSourceAccessor (&HomaL4Protocol::m_sirdReceiverCreditStateTrace),
                      "ns3::TracedCallback")
   ;
   return tid;
@@ -433,6 +446,12 @@ HomaL4Protocol::GetSirdSenderCsnThreshold (void) const
   return m_sirdSenderCsnThreshold;
 }
 
+Time
+HomaL4Protocol::GetSirdSenderCreditLaunchDelay (void) const
+{
+  return m_sirdSenderCreditLaunchDelay;
+}
+
 void
 // 封装 SIRD 授权决策的 trace 回调，向外暴露发送方预算与拥塞状态。
 HomaL4Protocol::TraceSirdGrantDecision (Ipv4Address sender,
@@ -508,6 +527,38 @@ HomaL4Protocol::TraceSirdLoopState (Ipv4Address receiver,
                         ceEwma,
                         loopState,
                         counterState);
+}
+
+void
+HomaL4Protocol::TraceSirdSenderCreditState (Ipv4Address sender,
+                                            Ipv4Address receiver,
+                                            uint16_t txMsgId,
+                                            uint32_t senderCreditPkts,
+                                            uint8_t eventType)
+{
+  m_sirdSenderCreditStateTrace (sender,
+                                receiver,
+                                txMsgId,
+                                senderCreditPkts,
+                                eventType);
+}
+
+void
+HomaL4Protocol::TraceSirdReceiverCreditState (Ipv4Address receiver,
+                                              Ipv4Address sender,
+                                              uint32_t receiverAvailPkts,
+                                              uint32_t receiverBudgetPkts,
+                                              uint32_t senderAvailPkts,
+                                              uint32_t senderBudgetPkts,
+                                              uint8_t eventType)
+{
+  m_sirdReceiverCreditStateTrace (receiver,
+                                  sender,
+                                  receiverAvailPkts,
+                                  receiverBudgetPkts,
+                                  senderAvailPkts,
+                                  senderBudgetPkts,
+                                  eventType);
 }
     
 // 根据当前状态进行条件判断，返回布尔决策供上层流程分支使用。
@@ -1232,6 +1283,14 @@ bool HomaOutboundMsg::GetNextPktOffset (uint16_t &pktOffset)
     
     if (nextPktOffset <= m_maxGrantedIdx && nextPktOffset < this->GetMsgSizePkts ())
     {
+      if (m_homa->IsSirdEnabled () &&
+          !m_sirdCreditAvailableTimes.empty () &&
+          m_sirdCreditAvailableTimes.front () > Simulator::Now ())
+      {
+        NS_LOG_LOGIC("HomaOutboundMsg (" << this
+                     << ") has scheduled credit, but its sender launch delay has not expired.");
+        return false;
+      }
       // The selected packet is not delivered and not on flight
       NS_LOG_LOGIC("HomaOutboundMsg (" << this 
                    << ") can send packet " << nextPktOffset << " next.");
@@ -1327,6 +1386,77 @@ HomaOutboundMsg::GetAccumulatedCreditPkts (void) const
     }
   return highestGranted - nextPktOffset + 1;
 }
+
+uint16_t
+HomaOutboundMsg::GetAvailableSirdCreditPkts (void) const
+{
+  uint16_t availablePkts = 0;
+  Time now = Simulator::Now ();
+  for (const auto& availableAt : m_sirdCreditAvailableTimes)
+    {
+      if (availableAt <= now)
+        {
+          ++availablePkts;
+        }
+    }
+  return availablePkts;
+}
+
+void
+HomaOutboundMsg::AddSirdCreditAvailability (uint16_t creditPkts)
+{
+  if (creditPkts == 0 || !m_homa->IsSirdEnabled ())
+    {
+      return;
+    }
+
+  Time availableAt = Simulator::Now () + m_homa->GetSirdSenderCreditLaunchDelay ();
+  for (uint16_t i = 0; i < creditPkts; ++i)
+    {
+      m_sirdCreditAvailableTimes.push_back (availableAt);
+    }
+}
+
+void
+HomaOutboundMsg::ConsumeSirdCredit (void)
+{
+  if (!m_homa->IsSirdEnabled () || m_sirdCreditAvailableTimes.empty ())
+    {
+      return;
+    }
+
+  NS_ASSERT_MSG (m_sirdCreditAvailableTimes.front () <= Simulator::Now (),
+                 "Trying to consume scheduled credit before sender launch delay expired.");
+  m_sirdCreditAvailableTimes.pop_front ();
+}
+
+bool
+HomaOutboundMsg::GetNextSirdCreditDelay (Time &delay) const
+{
+  if (!m_homa->IsSirdEnabled () ||
+      m_waitForFirstGrant ||
+      m_pktTxQ.empty () ||
+      m_sirdCreditAvailableTimes.empty ())
+    {
+      return false;
+    }
+
+  uint16_t nextPktOffset = m_pktTxQ.top ();
+  uint16_t msgSizePkts = m_msgSizeBytes / m_maxPayloadSize + (m_msgSizeBytes % m_maxPayloadSize != 0);
+  if (nextPktOffset > m_maxGrantedIdx || nextPktOffset >= msgSizePkts)
+    {
+      return false;
+    }
+
+  Time now = Simulator::Now ();
+  if (m_sirdCreditAvailableTimes.front () <= now)
+    {
+      return false;
+    }
+
+  delay = m_sirdCreditAvailableTimes.front () - now;
+  return true;
+}
     
 /*
  * This method updates the state for the corresponding outbound message
@@ -1344,7 +1474,9 @@ void HomaOutboundMsg::HandleGrantOffset (HomaHeader const &homaHeader)
   NS_ASSERT_MSG(grantOffset < this->GetMsgSizePkts (), 
                 "HomaOutboundMsg shouldn't be granted after it is already fully granted!");
   
-  bool firstGrant = m_waitForFirstGrant && grantOffset >= m_maxGrantedIdx;
+  bool wasWaitingForFirstGrant = m_waitForFirstGrant;
+  uint16_t oldMaxGrantedIdx = m_maxGrantedIdx;
+  bool firstGrant = wasWaitingForFirstGrant && grantOffset >= m_maxGrantedIdx;
   if (m_waitForFirstGrant && grantOffset >= m_maxGrantedIdx)
   {
     m_waitForFirstGrant = false;
@@ -1371,6 +1503,15 @@ void HomaOutboundMsg::HandleGrantOffset (HomaHeader const &homaHeader)
      * packets on flight. Then we can calculate the remaining bytes as the following.
     */
     m_remainingBytes = m_msgSizeBytes - (m_maxGrantedIdx+1 - m_homa->GetBdp ()) * m_maxPayloadSize;
+    uint16_t newCreditPkts = wasWaitingForFirstGrant ?
+                             static_cast<uint16_t> (grantOffset + 1) :
+                             static_cast<uint16_t> (grantOffset - oldMaxGrantedIdx);
+    AddSirdCreditAvailability (newCreditPkts);
+    m_homa->TraceSirdSenderCreditState (m_saddr,
+                                        m_daddr,
+                                        homaHeader.GetTxMsgId (),
+                                        this->GetAccumulatedCreditPkts (),
+                                        1);
   }
   else if (firstGrant)
   {
@@ -1379,6 +1520,12 @@ void HomaOutboundMsg::HandleGrantOffset (HomaHeader const &homaHeader)
                  << (uint16_t) prio << " for the first Grant.");
     m_prio = prio;
     m_prioSetByReceiver = true;
+    AddSirdCreditAvailability (static_cast<uint16_t> (grantOffset + 1));
+    m_homa->TraceSirdSenderCreditState (m_saddr,
+                                        m_daddr,
+                                        homaHeader.GetTxMsgId (),
+                                        this->GetAccumulatedCreditPkts (),
+                                        1);
   }
   else
   {
@@ -1395,6 +1542,11 @@ void HomaOutboundMsg::HandleResend (HomaHeader const &homaHeader)
   NS_ASSERT(homaHeader.GetFlags() & HomaHeader::Flags_t::RESEND);
   
   m_pktTxQ.push(homaHeader.GetPktOffset ());
+  m_homa->TraceSirdSenderCreditState (m_saddr,
+                                      m_daddr,
+                                      homaHeader.GetTxMsgId (),
+                                      this->GetAccumulatedCreditPkts (),
+                                      2);
 
   uint16_t grantOffset = homaHeader.GetGrantOffset();
   NS_ASSERT_MSG(grantOffset < this->GetMsgSizePkts (), 
@@ -1648,6 +1800,15 @@ bool HomaSendScheduler::GetNextPktOfMsg (uint16_t txMsgId, Ptr<Packet> &p)
   if (candidateMsg->GetNextPktOffset(pktOffset))
   {
     p = candidateMsg->RemoveNextPktFromTxQ(pktOffset);
+    if (m_homa->IsSirdEnabled ())
+    {
+      candidateMsg->ConsumeSirdCredit ();
+      m_homa->TraceSirdSenderCreditState (candidateMsg->GetSrcAddress (),
+                                          candidateMsg->GetDstAddress (),
+                                          txMsgId,
+                                          candidateMsg->GetAccumulatedCreditPkts (),
+                                          3);
+    }
       
     HomaHeader homaHeader;
     homaHeader.SetDstPort (candidateMsg->GetDstPort ());
@@ -1739,7 +1900,14 @@ HomaSendScheduler::TxDataPacket ()
   Ptr<Packet> p;
   if (this->GetNextMsgId (nextTxMsgID))
   {   
-    NS_ASSERT(this->GetNextPktOfMsg(nextTxMsgID, p));
+    bool pktFound = this->GetNextPktOfMsg(nextTxMsgID, p);
+    NS_ASSERT(pktFound);
+    if (!pktFound)
+    {
+      NS_LOG_WARN("HomaSendScheduler selected msg " << nextTxMsgID
+                  << " but could not build its next packet.");
+      return;
+    }
       
     NS_LOG_LOGIC("HomaSendScheduler (" << this <<
                   ") will transmit a packet from msg " << nextTxMsgID);
@@ -1755,6 +1923,24 @@ HomaSendScheduler::TxDataPacket ()
   else
   {
     NS_LOG_LOGIC("HomaSendScheduler doesn't have any packet to send!");
+    Time minCreditDelay;
+    bool haveDelayedCredit = false;
+    for (const auto& kv : m_outboundMsgs)
+      {
+        Time creditDelay;
+        if (kv.second->GetNextSirdCreditDelay (creditDelay) &&
+            (!haveDelayedCredit || creditDelay < minCreditDelay))
+          {
+            minCreditDelay = creditDelay;
+            haveDelayedCredit = true;
+          }
+      }
+    if (haveDelayedCredit)
+      {
+        m_txEvent = Simulator::Schedule (minCreditDelay,
+                                         &HomaSendScheduler::TxDataPacket,
+                                         this);
+      }
   }
 }
    
@@ -1852,6 +2038,14 @@ void HomaSendScheduler::ClearStateForMsg (uint16_t txMsgId)
   NS_LOG_FUNCTION(this << txMsgId);
 
   Ptr<HomaOutboundMsg> outMsg = m_outboundMsgs[txMsgId];
+  if (outMsg)
+    {
+      m_homa->TraceSirdSenderCreditState (outMsg->GetSrcAddress (),
+                                          outMsg->GetDstAddress (),
+                                          txMsgId,
+                                          0,
+                                          4);
+    }
   std::string key = MakePathRttKey (outMsg->GetSrcAddress (),
                                     outMsg->GetDstAddress (),
                                     outMsg->GetSrcPort (),
@@ -2326,6 +2520,8 @@ HomaRecvScheduler::HomaRecvScheduler (Ptr<HomaL4Protocol> homaL4Protocol)
   m_sirdCeRatioEwma = 0.0;
   m_sirdDataPktsObserved = 0;
   m_sirdCeMarksObserved = 0;
+  m_srrHaveLastGrantedSender = false;
+  m_srrLastGrantedSender = 0;
   m_creditTickEvent = EventId ();
 }
 
@@ -2423,6 +2619,19 @@ void HomaRecvScheduler::ReceivePacket (Ptr<Packet> packet,
                                         m_sirdGlobalCreditsInUsePkts,
                                         globalBudgetPkts,
                                         2);
+          double effectiveBudgetPkts = std::min (netBudgetPkts, hostBudgetPkts);
+          uint32_t senderBudgetPkts = static_cast<uint32_t> (std::max (1.0, effectiveBudgetPkts));
+          uint32_t senderAvailPkts = (senderBudgetPkts > inUseIt->second) ?
+                                     (senderBudgetPkts - inUseIt->second) : 0;
+          uint32_t receiverAvailPkts = (globalBudgetPkts > m_sirdGlobalCreditsInUsePkts) ?
+                                       (globalBudgetPkts - m_sirdGlobalCreditsInUsePkts) : 0;
+          m_homa->TraceSirdReceiverCreditState (ipv4Header.GetDestination (),
+                                                Ipv4Address (senderKey),
+                                                receiverAvailPkts,
+                                                globalBudgetPkts,
+                                                senderAvailPkts,
+                                                senderBudgetPkts,
+                                                2);
         }
       }//credit 归还
 
@@ -2752,107 +2961,180 @@ bool HomaRecvScheduler::SendAppropriateGrants()
   uint8_t grantingPrio = m_homa->GetNumUnschedPrioBands ();
   uint8_t overcommitDue = m_homa->GetOvercommitLevel ();
   const uint32_t globalBudgetPkts = std::max<uint32_t> (1, m_homa->GetSirdCreditBudgetPkts ());
-    
-  Ptr<HomaInboundMsg> currentMsg;
-  for (std::size_t i = 0; i < m_inboundMsgs.size(); ++i)
-  {
-    currentMsg = m_inboundMsgs[i];
-    currentMsg->SetCurrentlyScheduled (false);
+  const double baseBudget = static_cast<double> (std::max<uint16_t> (1, m_homa->GetBdp ()));
 
-    if (overcommitDue > 0)
+  for (auto& inboundMsg : m_inboundMsgs)
     {
-      grantingPrio = std::min(grantingPrio, (uint8_t)(m_homa->GetNumTotalPrioBands() - 1));
+      inboundMsg->SetCurrentlyScheduled (false);
+    }
 
-      Ipv4Address senderAddress = currentMsg->GetSrcAddress ();
-      uint32_t senderKey = senderAddress.Get ();
-      if (!currentMsg->IsFullyGranted () &&
-          grantedSenders.find(senderKey) == grantedSenders.end())
+  auto tryIssueGrant = [&] (Ptr<HomaInboundMsg> currentMsg) -> bool {
+    if (overcommitDue == 0 || currentMsg->IsFullyGranted ())
       {
-        if (m_busySenders.find(senderKey) == m_busySenders.end())
+        return false;
+      }
+
+    Ipv4Address senderAddress = currentMsg->GetSrcAddress ();
+    uint32_t senderKey = senderAddress.Get ();
+    if (grantedSenders.find (senderKey) != grantedSenders.end () ||
+        m_busySenders.find (senderKey) != m_busySenders.end ())
+      {
+        return false;
+      }
+
+    double netBudget = baseBudget;
+    auto netBudgetIt = m_sirdSenderBudgetNetPkts.find (senderKey);
+    if (netBudgetIt != m_sirdSenderBudgetNetPkts.end ())
+      {
+        netBudget = netBudgetIt->second;
+      }
+
+    bool senderCsn = false;
+    auto csnIt = m_sirdSenderCsnState.find (senderKey);
+    if (csnIt != m_sirdSenderCsnState.end ())
+      {
+        senderCsn = csnIt->second;
+      }
+
+    double hostBudget = baseBudget;
+    auto hostBudgetIt = m_sirdSenderBudgetHostPkts.find (senderKey);
+    if (hostBudgetIt != m_sirdSenderBudgetHostPkts.end ())
+      {
+        hostBudget = hostBudgetIt->second;
+      }
+
+    double budget = std::min (netBudget, hostBudget);
+    if (m_sirdSenderCreditsInUsePkts.find (senderKey) == m_sirdSenderCreditsInUsePkts.end ())
+      {
+        m_sirdSenderCreditsInUsePkts[senderKey] = 0;
+      }
+
+    uint32_t senderBudgetPkts = static_cast<uint32_t> (std::max (1.0, budget));
+    uint32_t senderInUsePkts = m_sirdSenderCreditsInUsePkts[senderKey];
+    uint32_t senderAvailPkts = (senderBudgetPkts > senderInUsePkts) ?
+                               (senderBudgetPkts - senderInUsePkts) : 0;
+    uint32_t globalAvailPkts = (globalBudgetPkts > m_sirdGlobalCreditsInUsePkts) ?
+                               (globalBudgetPkts - m_sirdGlobalCreditsInUsePkts) : 0;
+    bool issuedThisRound = false;
+
+    // SIRD issues one MSS-sized credit per tick. The credit bucket, not
+    // data arrival, should decide whether the next grant can be exposed.
+    if (senderAvailPkts > 0 && globalAvailPkts > 0 && !currentMsg->IsGrantable ())
+      {
+        currentMsg->AdvanceGrantableWindow (1);
+      }
+
+    if (senderAvailPkts > 0 && globalAvailPkts > 0 && currentMsg->IsGrantable ())
+      {
+        Ptr<Packet> grantPkt = currentMsg->GenerateGrantOrAck(grantingPrio,
+                                                              HomaHeader::Flags_t::GRANT);
+        HomaHeader traceHeader;
+        grantPkt->PeekHeader (traceHeader);
+
+        m_homa->TraceSirdGrantDecision (senderAddress,
+                                        currentMsg->GetTxMsgId (),
+                                        traceHeader.GetGrantOffset (),
+                                        budget,
+                                        m_sirdCeRatioEwma,
+                                        senderCsn);
+
+        m_homa->SendDown(grantPkt,
+                         currentMsg->GetDstAddress (),
+                         senderAddress);
+        currentMsg->SetCurrentlyScheduled (true);
+        m_sirdSenderCreditsInUsePkts[senderKey]++;
+        m_sirdGlobalCreditsInUsePkts++;
+        uint32_t senderAvailAfterPkts = (senderBudgetPkts > m_sirdSenderCreditsInUsePkts[senderKey]) ?
+                                        (senderBudgetPkts - m_sirdSenderCreditsInUsePkts[senderKey]) : 0;
+        uint32_t receiverAvailAfterPkts = (globalBudgetPkts > m_sirdGlobalCreditsInUsePkts) ?
+                                          (globalBudgetPkts - m_sirdGlobalCreditsInUsePkts) : 0;
+        m_homa->TraceSirdReceiverCreditState (currentMsg->GetDstAddress (),
+                                              senderAddress,
+                                              receiverAvailAfterPkts,
+                                              globalBudgetPkts,
+                                              senderAvailAfterPkts,
+                                              senderBudgetPkts,
+                                              1);
+        issuedThisRound = true;
+        grantIssued = true;
+      }
+
+    m_homa->TraceSirdBucketState (currentMsg->GetDstAddress (),
+                                  senderAddress,
+                                  hostBudget,
+                                  m_sirdSenderCreditsInUsePkts[senderKey],
+                                  m_sirdGlobalCreditsInUsePkts,
+                                  globalBudgetPkts,
+                                  issuedThisRound ? 1 : 0);
+
+    if (issuedThisRound)
+      {
+        grantedSenders.insert (senderKey);
+        overcommitDue--;
+        grantingPrio++;
+        if (m_homa->UseSrrScheduling ())
+          {
+            m_srrHaveLastGrantedSender = true;
+            m_srrLastGrantedSender = senderKey;
+          }
+      }
+
+    return issuedThisRound;
+  };
+
+  if (m_homa->UseSrrScheduling ())
+    {
+      std::vector<std::size_t> candidateIndices;
+      std::unordered_set<uint32_t> candidateSenders;
+      for (std::size_t i = 0; i < m_inboundMsgs.size (); ++i)
         {
-          double netBudget = static_cast<double> (std::max<uint16_t> (1, m_homa->GetBdp ()));
-          auto netBudgetIt = m_sirdSenderBudgetNetPkts.find (senderKey);
-          if (netBudgetIt != m_sirdSenderBudgetNetPkts.end ())
-          {
-            netBudget = netBudgetIt->second;
-          }
-          bool senderCsn = false;
-          auto csnIt = m_sirdSenderCsnState.find (senderKey);
-          if (csnIt != m_sirdSenderCsnState.end ())
-          {
-            senderCsn = csnIt->second;
-          }
+          Ptr<HomaInboundMsg> currentMsg = m_inboundMsgs[i];
+          uint32_t senderKey = currentMsg->GetSrcAddress ().Get ();
+          if (currentMsg->IsFullyGranted () ||
+              m_busySenders.find (senderKey) != m_busySenders.end () ||
+              candidateSenders.find (senderKey) != candidateSenders.end ())
+            {
+              continue;
+            }
+          candidateSenders.insert (senderKey);
+          candidateIndices.push_back (i);
+        }
 
-          double hostBudget = static_cast<double> (std::max<uint16_t> (1, m_homa->GetBdp ()));
-          auto hostBudgetIt = m_sirdSenderBudgetHostPkts.find (senderKey);
-          if (hostBudgetIt != m_sirdSenderBudgetHostPkts.end ())
-          {
-            hostBudget = hostBudgetIt->second;
-          }
+      if (m_srrHaveLastGrantedSender && !candidateIndices.empty ())
+        {
+          auto cursorIt = std::find_if (candidateIndices.begin (),
+                                        candidateIndices.end (),
+                                        [&] (std::size_t idx) {
+                                          return m_inboundMsgs[idx]->GetSrcAddress ().Get () ==
+                                                 m_srrLastGrantedSender;
+                                        });
+          if (cursorIt != candidateIndices.end ())
+            {
+              std::rotate (candidateIndices.begin (), cursorIt + 1, candidateIndices.end ());
+            }
+        }
 
-          double budget = std::min (netBudget, hostBudget);
+      for (std::size_t idx : candidateIndices)
+        {
+          if (overcommitDue == 0)
+            {
+              break;
+            }
+          grantingPrio = std::min (grantingPrio, (uint8_t)(m_homa->GetNumTotalPrioBands () - 1));
+          tryIssueGrant (m_inboundMsgs[idx]);
+        }
+      return grantIssued;
+    }
 
-          if (m_sirdSenderCreditsInUsePkts.find (senderKey) == m_sirdSenderCreditsInUsePkts.end ())
-          {
-            m_sirdSenderCreditsInUsePkts[senderKey] = 0;
-          }
-
-          uint32_t senderBudgetPkts = static_cast<uint32_t> (std::max (1.0, budget));
-          uint32_t senderInUsePkts = m_sirdSenderCreditsInUsePkts[senderKey];
-          uint32_t senderAvailPkts = (senderBudgetPkts > senderInUsePkts) ? (senderBudgetPkts - senderInUsePkts) : 0;
-          uint32_t globalAvailPkts = (globalBudgetPkts > m_sirdGlobalCreditsInUsePkts) ?
-                                     (globalBudgetPkts - m_sirdGlobalCreditsInUsePkts) : 0;
-          bool issuedThisRound = false;
-
-          // SIRD issues one MSS-sized credit per tick. The credit bucket, not
-          // data arrival, should decide whether the next grant can be exposed.
-          if (senderAvailPkts > 0 && globalAvailPkts > 0 && !currentMsg->IsGrantable ())
-          {
-            currentMsg->AdvanceGrantableWindow (1);
-          }
-
-          if (senderAvailPkts > 0 && globalAvailPkts > 0 && currentMsg->IsGrantable ())
-          {
-            Ptr<Packet> grantPkt = currentMsg->GenerateGrantOrAck(grantingPrio,
-                                                                   HomaHeader::Flags_t::GRANT);
-            HomaHeader traceHeader;
-            grantPkt->PeekHeader (traceHeader);
-
-            m_homa->TraceSirdGrantDecision (senderAddress,
-                                            currentMsg->GetTxMsgId (),
-                                            traceHeader.GetGrantOffset (),
-                                            budget,
-                                            m_sirdCeRatioEwma,
-                                            senderCsn);
-
-            m_homa->SendDown(grantPkt,
-                            currentMsg->GetDstAddress (),
-                            senderAddress);
-            currentMsg->SetCurrentlyScheduled(true);
-            m_sirdSenderCreditsInUsePkts[senderKey]++;
-            m_sirdGlobalCreditsInUsePkts++;
-            issuedThisRound = true;
-            grantIssued = true;
-          }
-
-	          m_homa->TraceSirdBucketState (currentMsg->GetDstAddress (),
-	                                        senderAddress,
-	                                        hostBudget,
-	                                        m_sirdSenderCreditsInUsePkts[senderKey],
-	                                        m_sirdGlobalCreditsInUsePkts,
-	                                        globalBudgetPkts,
-	                                        issuedThisRound ? 1 : 0);
-
-	          if (issuedThisRound)
-	          {
-	            grantedSenders.insert(senderKey);
-	            overcommitDue--;
-	            grantingPrio++;
-	          }
-	        }
-	      }
-	    }
-  }
+  for (std::size_t i = 0; i < m_inboundMsgs.size (); ++i)
+    {
+      if (overcommitDue == 0)
+        {
+          break;
+        }
+      grantingPrio = std::min (grantingPrio, (uint8_t)(m_homa->GetNumTotalPrioBands () - 1));
+      tryIssueGrant (m_inboundMsgs[i]);
+    }
   return grantIssued;
 }
 

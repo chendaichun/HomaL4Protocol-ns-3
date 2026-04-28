@@ -22,6 +22,7 @@
 #define HOMA_L4_PROTOCOL_H
 
 #include <stdint.h>
+#include <deque>
 #include <functional>
 #include <queue>
 #include <vector>
@@ -224,6 +225,12 @@ public:
   uint16_t GetSirdSenderCsnThreshold (void) const;
 
   /**
+   * \brief Delay between receiving scheduled credit and making it sendable.
+   * \return sender-side credit launch delay
+   */
+  Time GetSirdSenderCreditLaunchDelay (void) const;
+
+  /**
    * \brief Emit a SIRD grant-decision trace record.
    * \param sender Source sender address
    * \param txMsgId Message ID on sender side
@@ -301,6 +308,38 @@ public:
                            double ceEwma,
                            uint64_t loopState,
                            uint64_t counterState);
+
+  /**
+   * \brief Emit sender-side scheduled credit currently held by a sender.
+   * \param sender Sender address that owns the credit
+   * \param receiver Receiver address that issued the credit
+   * \param txMsgId Message id the credit applies to
+   * \param senderCreditPkts Unconsumed scheduled credit in packets
+   * \param eventType 1=grant received, 2=resend credit, 3=data sent, 4=message cleared
+   */
+  void TraceSirdSenderCreditState (Ipv4Address sender,
+                                   Ipv4Address receiver,
+                                   uint16_t txMsgId,
+                                   uint32_t senderCreditPkts,
+                                   uint8_t eventType);
+
+  /**
+   * \brief Emit receiver-side available credit after a bucket update.
+   * \param receiver Receiver address owning the bucket
+   * \param sender Sender address associated with this update
+   * \param receiverAvailPkts Remaining global receiver budget
+   * \param receiverBudgetPkts Total global receiver budget
+   * \param senderAvailPkts Remaining per-sender budget
+   * \param senderBudgetPkts Total per-sender budget
+   * \param eventType 1=grant issued, 2=credit reclaimed, 0=no grant
+   */
+  void TraceSirdReceiverCreditState (Ipv4Address receiver,
+                                     Ipv4Address sender,
+                                     uint32_t receiverAvailPkts,
+                                     uint32_t receiverBudgetPkts,
+                                     uint32_t senderAvailPkts,
+                                     uint32_t senderBudgetPkts,
+                                     uint8_t eventType);
     
   /**
    * \brief Return whether the memory optimizations are enabled
@@ -483,6 +522,7 @@ private:
   double m_sirdSenderAiStep;     //!< Additive increase step for sender feedback loop
   double m_sirdEcnAlphaGain;     //!< EWMA gain for ECN mark ratio
   uint16_t m_sirdSenderCsnThreshold; //!< Threshold for sender congestion notification in packets
+  Time m_sirdSenderCreditLaunchDelay; //!< Sender-side delay before received scheduled credit can launch data
     
   DataRate m_linkRate;       //!< Data Rate of the corresponding net device for this prototocol
   Time m_nextTimeTxQueWillBeEmpty;   //!< Total amount of bytes serialized since the last time 
@@ -511,6 +551,8 @@ private:
   TracedCallback<Ipv4Address, Ipv4Address, double, uint32_t, uint32_t, uint32_t, uint8_t> m_sirdBucketStateTrace; //!< Trace of {receiverIp, senderIp, senderBudgetHostPkts, senderInUsePkts, globalInUsePkts, globalBudgetPkts, eventType}
   TracedCallback<Ipv4Address, Ipv4Address, uint8_t, uint32_t, uint16_t, uint8_t, bool, uint32_t> m_sirdPacketStateTrace; //!< Trace of per-packet SIRD state
   TracedCallback<Ipv4Address, Ipv4Address, double, double, double, double, uint64_t, uint64_t> m_sirdLoopStateTrace; //!< Trace of per-sender SIRD loop state
+  TracedCallback<Ipv4Address, Ipv4Address, uint16_t, uint32_t, uint8_t> m_sirdSenderCreditStateTrace; //!< Trace of sender-held scheduled credit
+  TracedCallback<Ipv4Address, Ipv4Address, uint32_t, uint32_t, uint32_t, uint32_t, uint8_t> m_sirdReceiverCreditStateTrace; //!< Trace of receiver available credit
 };
     
 /******************************************************************************/
@@ -672,8 +714,28 @@ public:
    * \return number of granted-but-unsent scheduled packets
    */
   uint16_t GetAccumulatedCreditPkts (void) const;
+
+  /**
+   * \brief Count scheduled credits whose sender-side launch delay has expired.
+   * \return currently sendable scheduled credits
+   */
+  uint16_t GetAvailableSirdCreditPkts (void) const;
+
+  /**
+   * \brief Find when the next delayed SIRD credit becomes sendable.
+   * \param delay Time from now until the next credit can launch DATA
+   * \return true if this message is blocked only by sender-side credit delay
+   */
+  bool GetNextSirdCreditDelay (Time &delay) const;
+
+  /**
+   * \brief Consume one mature SIRD scheduled credit after a DATA packet is selected.
+   */
+  void ConsumeSirdCredit (void);
   
 private:
+  void AddSirdCreditAvailability (uint16_t creditPkts);
+
   Ipv4Address m_saddr;       //!< Source IP address of this message
   Ipv4Address m_daddr;       //!< Destination IP address of this message
   uint16_t m_sport;          //!< Source port of this message
@@ -696,6 +758,7 @@ private:
   bool m_prioSetByReceiver;  //!< Whether the receiver has specified a priority yet
   bool m_waitForFirstGrant;  //!< Whether first data packet must wait for explicit GRANT
   bool m_initialCreditRequestSent; //!< Whether the initial zero-payload request was sent
+  std::deque<Time> m_sirdCreditAvailableTimes; //!< Launch times for received scheduled credits
   
   EventId m_rtxEvent;        //!< The EventID for the retransmission timeout
   bool m_isExpired;          //!< Whether this message has expired and to be cleared upon rtx timeouts
@@ -1103,6 +1166,8 @@ private:
   double m_sirdCeRatioEwma; //!< EWMA of ECN CE ratio over received data packets
   uint64_t m_sirdDataPktsObserved; //!< Number of data packets observed for ECN ratio estimation
   uint64_t m_sirdCeMarksObserved; //!< Number of CE-marked packets observed
+  bool m_srrHaveLastGrantedSender; //!< Whether SRR has a valid sender cursor
+  uint32_t m_srrLastGrantedSender; //!< Sender key that most recently received SRR credit
   EventId m_creditTickEvent; //!< Periodic event for tick-driven credit issuance
 };
     

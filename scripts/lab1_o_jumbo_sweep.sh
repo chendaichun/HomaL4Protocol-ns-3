@@ -11,7 +11,8 @@ SHORT_INTERVAL_8B_US="${SHORT_INTERVAL_8B_US:-1}"
 SHORT_INTERVAL_500KB_US="${SHORT_INTERVAL_500KB_US:-1000}"
 LONG_MSG_SIZE_BYTES="${LONG_MSG_SIZE_BYTES:-10000000}"
 LONG_SENDER_RATE_GBPS="${LONG_SENDER_RATE_GBPS:-16.67}"
-BDP_PKTS="${BDP_PKTS:-150}"
+BDP_PKTS="${BDP_PKTS:-24}"
+MTU_BYTES="${MTU_BYTES:-9000}"
 DEVICE_QUEUE_MAX_SIZE="${DEVICE_QUEUE_MAX_SIZE:-1000p}"
 QDISC_MAX_SIZE="${QDISC_MAX_SIZE:-1000p}"
 REPLY_SIZE_BYTES="${REPLY_SIZE_BYTES:-8}"
@@ -26,7 +27,7 @@ read -r -a PROBE_COUNTS_ARR <<< "$PROBE_COUNTS_RAW"
 if [[ -z "${OUT_ROOT+x}" ]]; then
   TS="$(date +%Y%m%d_%H%M%S)"
   DAY="$(date +%Y%m%d)"
-  OUT_ROOT="/mnt/nasDisk_ds3617/sird/lab1_o/${DAY}/lab1_o_sweep_rr_delay4p5us_bdp150_${TS}"
+  OUT_ROOT="/mnt/nasDisk_ds3617/sird/lab1_o_jumbo/${DAY}/lab1_o_jumbo_sweep_rr_delay4p5us_mtu9000_bdp24_${TS}"
 fi
 if [[ "$OUT_ROOT" == *" "* ]]; then
   echo "OUT_ROOT must not contain spaces: $OUT_ROOT"
@@ -36,7 +37,7 @@ mkdir -p "$OUT_ROOT"
 
 export LD_LIBRARY_PATH="$ROOT_DIR/build/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
-BIN_PATH="$ROOT_DIR/build/scratch/lab1_o"
+BIN_PATH="$ROOT_DIR/build/scratch/lab1_o_jumbo"
 if [[ "$BUILD" == "1" || ! -x "$BIN_PATH" ]]; then
   ./waf build
 fi
@@ -48,6 +49,7 @@ COMMON_ARGS=(
   "--longMsgSizeBytes=$LONG_MSG_SIZE_BYTES"
   "--longSenderRateGbps=$LONG_SENDER_RATE_GBPS"
   "--bdpPkts=$BDP_PKTS"
+  "--mtuBytes=$MTU_BYTES"
   "--traceMsg=1"
   "--traceRequestReplyLatency=1"
   "--replySizeBytes=$REPLY_SIZE_BYTES"
@@ -102,6 +104,7 @@ run_case() {
 echo "OUT_ROOT=$OUT_ROOT"
 echo "probe_counts=$PROBE_COUNTS_RAW"
 echo "probe_start_delay_us=$PROBE_START_DELAY_US"
+echo "mtu_bytes=$MTU_BYTES"
 echo "sim_jobs=$SIM_JOBS"
 echo "starting $((${#PROBE_COUNTS_ARR[@]} * 5)) simulation processes"
 

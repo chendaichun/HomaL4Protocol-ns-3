@@ -84,27 +84,44 @@ class SirdLoopSample:
         self.event_type = event_type
 
 
-def count_msg_events(path: Path, size: int) -> Tuple[int, int]:
+def count_msg_events(
+    path: Path,
+    size: int,
+    min_start_sec: Optional[float] = None,
+) -> Tuple[int, int]:
     started = 0
     finished = 0
     if not path.exists():
         return started, finished
+
+    min_start_ns = None if min_start_sec is None else int(min_start_sec * 1e9)
+    starts: Dict[Tuple[str, str, str, str, int], int] = {}
 
     with path.open("r", encoding="utf-8") as handle:
         for line in handle:
             parts = line.split()
             if len(parts) != 6:
                 continue
+            event, time_ns_s, size_s, src, dst, tx_msg_id = parts
             try:
-                msg_size = int(parts[2])
+                time_ns = int(time_ns_s)
+                msg_size = int(size_s)
             except ValueError:
                 continue
             if msg_size != size:
                 continue
-            if parts[0] == "+":
-                started += 1
-            elif parts[0] == "-":
-                finished += 1
+            key = (src, dst, tx_msg_id, str(msg_size), msg_size)
+            if event == "+":
+                starts[key] = time_ns
+                if min_start_ns is None or time_ns >= min_start_ns:
+                    started += 1
+            elif event == "-":
+                if min_start_ns is None:
+                    finished += 1
+                else:
+                    start_ns = starts.pop(key, None)
+                    if start_ns is not None and start_ns >= min_start_ns:
+                        finished += 1
     return started, finished
 
 
@@ -197,6 +214,16 @@ def parse_msg_trace(path: Path) -> List[MsgRecord]:
                     )
                 )
     return records
+
+
+def filter_msg_records(
+    records: List[MsgRecord],
+    min_start_sec: Optional[float],
+) -> List[MsgRecord]:
+    if min_start_sec is None:
+        return records
+    min_start_ns = int(min_start_sec * 1e9)
+    return [record for record in records if record.start_ns >= min_start_ns]
 
 
 def parse_kv_line(line: str) -> Tuple[Optional[int], Dict[str, str]]:
@@ -419,18 +446,20 @@ def plot_fct_cdf(
     out_dir: Path,
     tags: List[str],
     sizes: List[int],
+    min_msg_start_sec: Optional[float],
 ) -> None:
     for size in sizes:
         plt.figure(figsize=(7.2, 4.2))
         plotted = False
         for tag in tags:
-            records = parse_msg_trace(trace_dir / f"lab1_{tag}.msg.tr")
+            trace_path = trace_dir / f"lab1_{tag}.msg.tr"
+            records = filter_msg_records(parse_msg_trace(trace_path), min_msg_start_sec)
             fcts = [r.fct_us for r in records if r.size == size]
             xs, ys = cdf_points(fcts)
             if not xs:
                 continue
             plotted = True
-            started, finished = count_msg_events(trace_dir / f"lab1_{tag}.msg.tr", size)
+            started, finished = count_msg_events(trace_path, size, min_msg_start_sec)
             p50 = percentile(fcts, 50)
             p99 = percentile(fcts, 99)
             suffix = ""
@@ -572,16 +601,23 @@ def plot_all_link_throughput(
         plt.close()
 
 
-def write_summary(trace_dir: Path, out_dir: Path, tags: List[str], sizes: List[int]) -> None:
+def write_summary(
+    trace_dir: Path,
+    out_dir: Path,
+    tags: List[str],
+    sizes: List[int],
+    min_msg_start_sec: Optional[float],
+) -> None:
     lines: List[str] = []
     lines.append("tag,size,started,finished,incomplete,count,p50_us,p99_us,mean_us")
     for tag in tags:
-        records = parse_msg_trace(trace_dir / f"lab1_{tag}.msg.tr")
+        trace_path = trace_dir / f"lab1_{tag}.msg.tr"
+        records = filter_msg_records(parse_msg_trace(trace_path), min_msg_start_sec)
         for size in sizes:
             fcts = [r.fct_us for r in records if r.size == size]
             if not fcts:
                 continue
-            started, finished = count_msg_events(trace_dir / f"lab1_{tag}.msg.tr", size)
+            started, finished = count_msg_events(trace_path, size, min_msg_start_sec)
             p50 = percentile(fcts, 50)
             p99 = percentile(fcts, 99)
             mean = sum(fcts) / len(fcts)
@@ -617,6 +653,12 @@ def main() -> int:
         help="Traffic start time, used only to shift time-series x axes.",
     )
     parser.add_argument(
+        "--min-msg-start-sec",
+        type=float,
+        default=None,
+        help="Only include message latency/FCT samples whose start time is at or after this simulation time.",
+    )
+    parser.add_argument(
         "--sird-loop-window-us",
         type=float,
         default=500.0,
@@ -633,13 +675,13 @@ def main() -> int:
         raise SystemExit(f"No lab1_*.msg.tr traces found under {trace_dir}")
 
     sizes = args.sizes or [8, 500000]
-    plot_fct_cdf(trace_dir, out_dir, tags, sizes)
+    plot_fct_cdf(trace_dir, out_dir, tags, sizes, args.min_msg_start_sec)
     plot_queue_timeseries(trace_dir, out_dir, tags, args.start_sec)
     plot_queue_cdf(trace_dir, out_dir, tags)
     plot_receiver_throughput(trace_dir, out_dir, tags, args.start_sec)
     plot_all_link_throughput(trace_dir, out_dir, tags, args.start_sec)
     plot_sender_sird_loop(trace_dir, out_dir, tags, args.start_sec, args.sird_loop_window_us)
-    write_summary(trace_dir, out_dir, tags, sizes)
+    write_summary(trace_dir, out_dir, tags, sizes, args.min_msg_start_sec)
 
     print(f"Wrote lab1 plots and summary to {out_dir}")
     return 0

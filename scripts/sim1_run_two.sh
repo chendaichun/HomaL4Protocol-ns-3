@@ -4,7 +4,11 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-TRACE_DIR="${TRACE_DIR:-/mnt/nasDisk_ds3617/sird/HomaL4Protocol-sim1-large-leaf-spine}"
+if [[ -z "${TRACE_DIR+x}" ]]; then
+  TS="$(date +%Y%m%d_%H%M%S)"
+  DAY="$(date +%Y%m%d)"
+  TRACE_DIR="/mnt/nasDisk_ds3617/sird/sim1/${DAY}/HomaL4Protocol-sim1-large-leaf-spine_${TS}"
+fi
 BUILD="${BUILD:-1}"
 TRAFFIC_CONFIGS="${TRAFFIC_CONFIGS:-balanced core incast}"
 OFFERED_LOAD="${OFFERED_LOAD:-0.5}"
@@ -20,7 +24,7 @@ TRACE_TOR_QUEUE="${TRACE_TOR_QUEUE:-1}"
 TRACE_GOODPUT="${TRACE_GOODPUT:-1}"
 DEVICE_QUEUE_MAX_SIZE="${DEVICE_QUEUE_MAX_SIZE:-2000p}"
 QDISC_MAX_SIZE="${QDISC_MAX_SIZE:-1000p}"
-QDISC_MARK_THRESHOLD="${QDISC_MARK_THRESHOLD:-120p}"
+QDISC_MARK_THRESHOLD="${QDISC_MARK_THRESHOLD:-}"
 SUMMARY_FILE="${SUMMARY_FILE:-$TRACE_DIR/sim1_matrix_summary.csv}"
 ENFORCE_MSG_COMPLETE="${ENFORCE_MSG_COMPLETE:-0}"
 
@@ -48,23 +52,28 @@ run_case() {
       "$TRACE_DIR/sim1_${tag}.goodput.tr"
 
     echo "[$tag] attempt=$attempt settleTailSec=$settle_tail_sec start $(date '+%F %T') workload=$workload_file trafficConfig=$traffic_config offeredLoad=$OFFERED_LOAD" | tee "$log_file"
-    "$BIN_PATH" \
-      "--simTag=$tag" \
-      "--outputDir=$TRACE_DIR" \
-      "--trafficConfig=$traffic_config" \
-      "--workloadFile=$workload_file" \
-      "--offeredLoad=$OFFERED_LOAD" \
-      "--startSec=$START_SEC" \
-      "--durationSec=$DURATION_SEC" \
-      "--settleTailSec=$settle_tail_sec" \
-      "--traceMsg=$TRACE_MSG" \
-      "--traceTorQueue=$TRACE_TOR_QUEUE" \
-      "--traceGoodput=$TRACE_GOODPUT" \
-      "--queueSampleUs=$QUEUE_SAMPLE_US" \
-      "--goodputSampleUs=$GOODPUT_SAMPLE_US" \
-      "--deviceQueueMaxSize=$DEVICE_QUEUE_MAX_SIZE" \
-      "--qdiscMaxSize=$QDISC_MAX_SIZE" \
-      "--qdiscMarkThreshold=$QDISC_MARK_THRESHOLD" >>"$log_file" 2>&1
+    local args=(
+      "--simTag=$tag"
+      "--outputDir=$TRACE_DIR"
+      "--trafficConfig=$traffic_config"
+      "--workloadFile=$workload_file"
+      "--offeredLoad=$OFFERED_LOAD"
+      "--startSec=$START_SEC"
+      "--durationSec=$DURATION_SEC"
+      "--settleTailSec=$settle_tail_sec"
+      "--traceMsg=$TRACE_MSG"
+      "--traceTorQueue=$TRACE_TOR_QUEUE"
+      "--traceGoodput=$TRACE_GOODPUT"
+      "--queueSampleUs=$QUEUE_SAMPLE_US"
+      "--goodputSampleUs=$GOODPUT_SAMPLE_US"
+      "--deviceQueueMaxSize=$DEVICE_QUEUE_MAX_SIZE"
+      "--qdiscMaxSize=$QDISC_MAX_SIZE"
+    )
+    if [[ -n "$QDISC_MARK_THRESHOLD" ]]; then
+      args+=("--qdiscMarkThreshold=$QDISC_MARK_THRESHOLD")
+    fi
+
+    "$BIN_PATH" "${args[@]}" >>"$log_file" 2>&1
 
     local msg_trace="$TRACE_DIR/sim1_${tag}.msg.tr"
     local started=0
@@ -97,8 +106,8 @@ run_case() {
 
 pids=()
 read -r -a traffic_configs <<< "$TRAFFIC_CONFIGS"
-workload_tags=(dctcp facebook_hadoop)
-workload_files=(inputs/DCTCP-MsgSizeDist.txt inputs/Facebook_HadoopDist_All.txt)
+workload_tags=(google_rpc facebook_hadoop web_search)
+workload_files=(inputs/W3_Google_AllRPC_cdf.csv inputs/W4_Facebook_Hadoop_cdf.csv inputs/W5_DCTCP_scaled1442_bytes_cdf.csv)
 
 for traffic_config in "${traffic_configs[@]}"; do
   for idx in "${!workload_tags[@]}"; do

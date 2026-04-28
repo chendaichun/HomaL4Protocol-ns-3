@@ -415,7 +415,7 @@ main (int argc, char* argv[])
   // 业务流开始注入的仿真时刻，预留时间给路由和协议初始化。
   double startSec = 0.2;
 
-  // 业务流持续时间：6 个长流发送端和 1 个短流 probe 发送端都只在这个窗口内生成消息。
+  // Probe 测量窗口持续时间；背景长流会从 startSec 开始，并持续覆盖这个 probe 窗口。
   double durationSec = 0.001;
 
   // 发流停止后的排空时间，用来等待在途包和消息完成事件。
@@ -435,6 +435,9 @@ main (int argc, char* argv[])
 
   // Probe 最多发送多少条消息；0 表示只按 durationSec 控制，不限制条数。
   uint32_t targetProbeMessages = 0;
+
+  // Probe 相对背景长流的延迟启动时间。用于避免把背景流冷启动瞬态计入 request/reply latency。
+  uint64_t probeStartDelayUs = 0;
 
   // 是否注入 6 个 10MB 背景长流；关闭后可生成 unloaded probe baseline。
   bool enableBackgroundTraffic = true;
@@ -518,6 +521,7 @@ main (int argc, char* argv[])
   cmd.AddValue ("shortMsgSizeBytes", "Probe short-flow message size, e.g. 8 or 500000", shortMsgSizeBytes);
   cmd.AddValue ("shortIntervalUs", "Probe send interval in microseconds", shortIntervalUs);
   cmd.AddValue ("targetProbeMessages", "Maximum number of probe messages to send; 0 means unlimited within durationSec", targetProbeMessages);
+  cmd.AddValue ("probeStartDelayUs", "Delay probe traffic after background traffic starts, in microseconds", probeStartDelayUs);
   cmd.AddValue ("enableBackgroundTraffic", "Whether to generate the 6 long background senders", enableBackgroundTraffic);
   cmd.AddValue ("useSrrScheduling", "Use FIFO/SRR-like receiver scheduling instead of SRPT", useSrrScheduling);
   cmd.AddValue ("traceMsg", "Whether to trace message begin/finish events", traceMsg);
@@ -713,8 +717,9 @@ main (int argc, char* argv[])
     }
 
   Time startTime = Seconds (startSec);
-  Time stopTime = Seconds (startSec + durationSec);
-  Time simStopTime = Seconds (startSec + durationSec + settleTailSec);
+  Time probeStartTime = startTime + MicroSeconds (probeStartDelayUs);
+  Time stopTime = probeStartTime + Seconds (durationSec);
+  Time simStopTime = stopTime + Seconds (settleTailSec);
 
   if (traceSwitchEgressQueue)
     {
@@ -775,7 +780,7 @@ main (int argc, char* argv[])
   if (traceRequestReplyLatency)
     {
       probeSock->SetRecvCallback (MakeCallback (&ProbeReplyReceive));
-      Simulator::Schedule (startTime,
+      Simulator::Schedule (probeStartTime,
                            &SendProbeRequest,
                            probeSock,
                            receiverAddr,
@@ -786,7 +791,7 @@ main (int argc, char* argv[])
     }
   else
     {
-      Simulator::Schedule (startTime,
+      Simulator::Schedule (probeStartTime,
                            &SendPeriodic,
                            probeSock,
                            receiverAddr,

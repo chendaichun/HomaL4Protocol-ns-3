@@ -37,7 +37,9 @@ DEVICE_QUEUE_MAX_SIZE="${DEVICE_QUEUE_MAX_SIZE:-1000p}"
 QDISC_MAX_SIZE="${QDISC_MAX_SIZE:-1000p}"
 
 if [[ -z "${OUT_DIR+x}" ]]; then
-  OUT_DIR="outputs/sird-scenarios/bolt-lab1"
+  TS="$(date +%Y%m%d_%H%M%S)"
+  DAY="$(date +%Y%m%d)"
+  OUT_DIR="outputs/sird-scenarios/${DAY}/bolt-lab1_${PROFILE}_${TS}"
 fi
 if [[ "$OUT_DIR" == *" "* ]]; then
   echo "OUT_DIR must not contain spaces because ns-3 trace output parsing truncates such paths: $OUT_DIR"
