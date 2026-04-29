@@ -307,8 +307,8 @@ main (int argc, char* argv[])
   // 6 个 background 长流发送端的单条消息大小；默认 10MB。
   uint32_t longMsgSizeBytes = 10000000;
 
-  // 每个长流发送端的 offered rate；6 个发送端各 16.67Gbps，合计约 100Gbps。
-  double longSenderRateGbps = 16.67;
+  // 每个长流发送端的 offered rate；这里固定为 17Gbps。
+  double longSenderRateGbps = 17.0;
 
   // 短流 probe 的单条消息大小；8 表示 8B 短消息，500000 表示 500KB 短消息。
   uint32_t shortMsgSizeBytes = 8;
