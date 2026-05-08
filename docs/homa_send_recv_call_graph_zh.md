@@ -1,116 +1,171 @@
 # Homa/SIRD 发送端与接收端函数调用图
 
-这份文档给出两张函数调用图：
+这份文档按当前代码结构重写，和以下三个实现文件保持一致：
 
-- 发送端主流程图
-- 接收端主流程图
+- `src/internet/model/homa-l4-protocol-core.cc`
+- `src/internet/model/homa-l4-protocol-send.cc`
+- `src/internet/model/homa-l4-protocol-recv.cc`
 
-每个节点统一写三类信息：
+文档分成两张图：
+
+- 发送端主流程
+- 接收端主流程
+
+每个节点统一给出三类信息：
 
 - `函数名`
 - `作用`
-- `主要修改的状态量`
+- `主要读写的长期状态`
 
-图中约定：
-
-- 蓝色箭头：DATA 主路径
-- 橙色箭头：GRANT / ACK / RESEND 控制路径
-- 绿色虚线：SIRD credit / CE / CSN 控制逻辑
-
-## 1. 发送端函数调用图
+## 1. 发送端主流程
 
 ```mermaid
 flowchart TD
-    A["App / HomaSocket<br/>提交完整 message"] --> B["HomaL4Protocol::Send()<br/>作用: 发送入口，创建发送侧消息对象<br/>修改: 无长期状态；触发 m_msgBeginTrace"]
-    B --> C["HomaOutboundMsg::HomaOutboundMsg()<br/>作用: 分片、初始化发送窗口、设置是否等待首个 GRANT<br/>修改: m_msgSizeBytes, m_remainingBytes, m_pktTxQ, m_maxGrantedIdx, m_waitForFirstGrant, m_prioSetByReceiver, m_sirdCreditAvailableTimes"]
-    B --> D["HomaSendScheduler::ScheduleNewMsg()<br/>作用: 分配 txMsgId，把消息挂到发送调度器<br/>修改: m_outboundMsgs, m_txMsgIdFreeList, m_txEvent"]
-    D --> E["HomaSendScheduler::TxDataPacket()<br/>作用: 发送调度主循环，等待链路空闲后挑选下一包<br/>修改: m_txEvent"]
-    E --> F["HomaSendScheduler::GetNextMsgId()<br/>作用: 从活跃 outbound messages 中选下一条可发送消息<br/>修改: 可能触发 ClearStateForMsg 清理过期消息"]
-    F --> G["HomaSendScheduler::GetNextPktOfMsg()<br/>作用: 生成下一个 DATA 包或初始 credit request<br/>修改: HomaOutboundMsg::m_pktTxQ, m_sirdCreditAvailableTimes；TraceSirdSenderCreditState(event=3)"]
-    G --> H["HomaL4Protocol::SendDown()<br/>作用: 封装并下发到 IPv4；设置 prio / ECN / CSN<br/>修改: m_nextTimeTxQueWillBeEmpty；触发 m_dataSendTrace"]
-    H --> I["Network<br/>DATA 到达接收端"]
+    A["App / HomaSocket<br/>提交完整 message"] --> B["HomaL4Protocol::Send()<br/>作用：发送入口，创建发送侧消息对象并交给发送调度器<br/>状态：触发 m_msgBeginTrace"]
 
-    J["HomaL4Protocol::Receive()<br/>作用: 收到 GRANT / RESEND / ACK 后分发给发送调度器<br/>修改: 无核心长期状态"] --> K["HomaSendScheduler::CtrlPktRecvdForOutboundMsg()<br/>作用: 处理发送侧控制包<br/>修改: 视控制包类型更新 outbound 状态；必要时重启 m_txEvent"]
-    K --> L["HomaOutboundMsg::HandleGrantOffset()<br/>作用: 更新授权上界与优先级，发放 scheduled credit<br/>修改: m_maxGrantedIdx, m_prio, m_prioSetByReceiver, m_waitForFirstGrant, m_remainingBytes, m_sirdCreditAvailableTimes"]
-    K --> M["HomaOutboundMsg::HandleResend()<br/>作用: 将缺失 packet 重新入队<br/>修改: m_pktTxQ；必要时更新 m_maxGrantedIdx, m_prio, m_prioSetByReceiver"]
-    K --> N["HomaOutboundMsg::HandleAck()<br/>作用: 最终确认消息完成<br/>修改: m_remainingBytes = 0"]
-    N --> O["HomaSendScheduler::ClearStateForMsg()<br/>作用: 清理发送侧消息状态并回收 txMsgId<br/>修改: m_outboundMsgs, m_txMsgIdFreeList；取消 rtxEvent；TraceSirdSenderCreditState(event=4)"]
+    B --> C["HomaOutboundMsg::HomaOutboundMsg()<br/>作用：分片并初始化发送窗口<br/>状态：m_pktTxQ, m_packets/m_pktSizes, m_remainingBytes, m_maxGrantedIdx, m_waitForFirstGrant, m_initialCreditRequestSent"]
+    B --> D["HomaSendScheduler::ScheduleNewMsg()<br/>作用：分配 txMsgId，并把消息挂到发送调度器<br/>状态：m_outboundMsgs, m_txMsgIdFreeList, m_txEvent"]
 
-    I -. "接收端发回 GRANT / RESEND / ACK" .-> J
+    D --> E["HomaSendScheduler::TxDataPacket()<br/>作用：发送侧主循环，在链路空闲时挑选下一包<br/>状态：m_txEvent"]
+    E --> F["HomaSendScheduler::GetNextPacket()<br/>作用：决定下一条消息，以及下一包是 credit request 还是 DATA<br/>状态：读 m_outboundMsgs；可能消费 sender credit"]
+    F --> G["HomaSendScheduler::SelectNextSendableMsgId()<br/>作用：从活跃消息中选最该发的一条，并清理过期消息<br/>状态：可能触发 ClearStateForMsg()"]
+    F --> H["HomaOutboundMsg::NeedsInitialCreditRequest()<br/>作用：判断长消息是否先发零负载 DATA 请求首个 GRANT<br/>状态：读 m_waitForFirstGrant, m_initialCreditRequestSent"]
+    F --> I["HomaOutboundMsg::TryGetNextPktOffset()<br/>作用：判断当前是否存在真正可发的数据分片<br/>状态：读 m_pktTxQ, m_maxGrantedIdx, m_sirdCreditAvailableTimes"]
+    F --> J["HomaOutboundMsg::RemoveNextPktFromTxQ()<br/>作用：弹出一个待发送/重传分片<br/>状态：m_pktTxQ"]
+    F --> K["HomaOutboundMsg::ConsumeSirdCredit()<br/>作用：消耗一笔已经成熟的 sender-side scheduled credit<br/>状态：m_sirdCreditAvailableTimes"]
+    J --> L["HomaL4Protocol::SendDown()<br/>作用：下发到 IPv4，记录序列化占用和 trace<br/>状态：m_nextTimeTxQueWillBeEmpty"]
+    L --> M["Network<br/>DATA 发往接收端"]
+
+    M -. "GRANT / RESEND / ACK 返回" .-> N["HomaL4Protocol::Receive()<br/>作用：解析控制包并分发给发送调度器<br/>状态：无发送侧长期状态改动"]
+    N --> O["HomaSendScheduler::HandleControlPacketForOutboundMsg()<br/>作用：处理 GRANT/RESEND/ACK 并推动发送状态机前进<br/>状态：必要时重启 m_txEvent"]
+    O --> P["HomaOutboundMsg::HandleGrantOffset()<br/>作用：推进授权上界，记录接收端优先级，发放 sender-side credit<br/>状态：m_maxGrantedIdx, m_prio, m_prioSetByReceiver, m_waitForFirstGrant, m_sirdCreditAvailableTimes, m_remainingBytes"]
+    O --> Q["HomaOutboundMsg::HandleResend()<br/>作用：把缺失分片重新加入发送队列<br/>状态：m_pktTxQ；必要时更新 m_maxGrantedIdx, m_prio"]
+    O --> R["HomaOutboundMsg::HandleAck()<br/>作用：确认消息完成<br/>状态：m_remainingBytes = 0"]
+    R --> S["HomaSendScheduler::ClearStateForMsg()<br/>作用：清理发送侧消息状态并回收 txMsgId<br/>状态：m_outboundMsgs, m_txMsgIdFreeList；可能记录 sender credit 清理 trace"]
 
     classDef sender fill:#eef6ff,stroke:#2f6fb3,stroke-width:1px,color:#111;
     classDef network fill:#fff6e8,stroke:#d88900,stroke-width:1px,color:#111;
-    class A,B,C,D,E,F,G,H,J,K,L,M,N,O sender;
-    class I network;
+    class A,B,C,D,E,F,G,H,I,J,K,L,N,O,P,Q,R,S sender;
+    class M network;
 ```
 
-### 发送端图怎么读
+### 发送端调用链说明
 
-1. 应用把一个完整 message 交给 `HomaL4Protocol::Send()`。
-2. `Send()` 创建 `HomaOutboundMsg`，在这里完成分片、初始化 unscheduled/scheduled 发送窗口。
-3. `ScheduleNewMsg()` 给消息分配 `txMsgId`，并挂到 `HomaSendScheduler::m_outboundMsgs`。
-4. `TxDataPacket()` 是发送端主循环。它会先选消息，再选 packet，然后调用 `SendDown()` 发包。
-5. 如果接收端发来 `GRANT/RESEND/ACK`，控制包会从 `Receive()` 进入 `CtrlPktRecvdForOutboundMsg()`。
-6. `HandleGrantOffset()` 是发送端最关键的状态推进函数：它更新 `m_maxGrantedIdx` 和发送优先级，并把接收到的 scheduled credit 放进 `m_sirdCreditAvailableTimes`。
-7. `HandleAck()` 后进入 `ClearStateForMsg()`，消息生命周期结束。
+1. `HomaL4Protocol::Send()` 是应用层发送入口，只负责创建 `HomaOutboundMsg` 并把它交给 `HomaSendScheduler`。
+2. `HomaOutboundMsg::HomaOutboundMsg()` 在消息级别完成初始化：分片、建立 `m_pktTxQ`、决定是否等待首个 `GRANT`。
+3. `HomaSendScheduler::ScheduleNewMsg()` 给每条消息分配一个 `txMsgId`，随后由 `m_txEvent` 驱动 `TxDataPacket()` 进入包级发送循环。
+4. `TxDataPacket()` 并不直接“自己挑包”，而是调用 `GetNextPacket()`。`GetNextPacket()` 再内部走两步：
+   - `SelectNextSendableMsgId()`：从所有活跃消息里选最该发送的一条；
+   - 对该消息调用 `NeedsInitialCreditRequest()` / `TryGetNextPktOffset()` / `RemoveNextPktFromTxQ()`。
+5. 对长消息，第一步可能不是发送真实 payload，而是发送 `GenerateInitialCreditRequest()` 生成的零负载 DATA，请求接收端显式给第一笔 `GRANT`。
+6. 一旦发出的是真实 DATA，SIRD 模式下会消耗一笔已经成熟的 sender-side credit，即 `ConsumeSirdCredit()`。
+7. 控制包路径统一从 `HomaL4Protocol::Receive()` 进入发送调度器：
+   - `GRANT` -> `HandleGrantOffset()`
+   - `RESEND` -> `HandleGrantOffset()` + `HandleResend()`
+   - `ACK` -> `HandleAck()` + `ClearStateForMsg()`
+8. `HandleGrantOffset()` 是发送端最关键的状态推进点。它不仅推进 `m_maxGrantedIdx`，还把新增授权映射为 `m_sirdCreditAvailableTimes` 中未来可以真正起飞的 sender credit。
 
-## 2. 接收端函数调用图
+## 2. 接收端主流程
 
 ```mermaid
 flowchart TD
-    A["Network<br/>DATA / BUSY 到达接收端"] --> B["HomaL4Protocol::Receive()<br/>作用: 接收入口，解析 Homa 头并分发到接收调度器<br/>修改: 触发 m_dataRecvTrace / m_ctrlRecvTrace / TraceSirdPacketState"]
-    B --> C["HomaRecvScheduler::ReceivePacket()<br/>作用: 接收侧主入口；处理 DATA/BUSY；驱动 SIRD credit loop<br/>修改: m_busySenders, m_sirdSenderBudgetNetPkts, m_sirdSenderBudgetHostPkts, m_sirdSenderCreditsInUsePkts, m_sirdGlobalCreditsInUsePkts, m_sirdSenderCsnState, m_sirdSenderCeState, m_sirdCeRatioEwma, 各类 epoch/统计计数"]
-    C --> D["HomaRecvScheduler::ReceiveDataPacket()<br/>作用: 将 DATA 归并到对应 inbound message<br/>修改: m_inboundMsgs 列表可能新增或重排"]
-    D --> E["HomaInboundMsg::HomaInboundMsg()<br/>作用: 首包到来时创建接收侧消息状态<br/>修改: m_msgSizePkts, m_remainingBytes, m_receivedPackets, m_maxGrantedIdx, m_maxGrantableIdx, m_hasGrantedData, m_creditDrivenGrantWindow, m_lastRtxGrntIdx"]
-    D --> F["HomaInboundMsg::ReceiveDataPacket()<br/>作用: 记录收到的 packet，推进 grantable window<br/>修改: m_receivedPackets, m_remainingBytes, m_pktSizes / m_packets, m_maxGrantableIdx"]
-    F --> G["HomaRecvScheduler::ScheduleMsgAtIdx()<br/>作用: 按 SRPT 或 SRR 重新排列活跃消息<br/>修改: m_inboundMsgs 顺序"]
-    G --> H["HomaRecvScheduler::EnsureCreditTickScheduled()<br/>作用: 若存在 grant opportunity，则安排 credit tick<br/>修改: m_creditTickEvent"]
-    H --> I["HomaRecvScheduler::CreditTick()<br/>作用: 按一个 full-data-packet serialization time 周期释放 credit<br/>修改: m_creditTickEvent"]
-    I --> J["HomaRecvScheduler::SendAppropriateGrants()<br/>作用: 选择该给谁发 GRANT，是接收端 credit control 核心<br/>修改: m_sirdSenderCreditsInUsePkts, m_sirdGlobalCreditsInUsePkts, m_srrLastGrantedSender, m_srrHaveLastGrantedSender, inboundMsg::m_currentlyScheduled"]
-    J --> K["HomaInboundMsg::AdvanceGrantableWindow()<br/>作用: 把一个 credit 暴露为新的 grantable window<br/>修改: m_maxGrantableIdx"]
-    J --> L["HomaInboundMsg::GenerateGrantOrAck(GRANT)<br/>作用: 生成 GRANT 控制包<br/>修改: m_prio, m_maxGrantedIdx, m_hasGrantedData"]
-    L --> M["HomaL4Protocol::SendDown()<br/>作用: 把 GRANT 发回发送端<br/>修改: m_nextTimeTxQueWillBeEmpty；触发 TraceSirdGrantDecision / TraceSirdReceiverCreditState"]
+    A["Network<br/>DATA / BUSY 到达接收端"] --> B["HomaL4Protocol::Receive()<br/>作用：解析 Homa 头并按 DATA/BUSY 与 GRANT/RESEND/ACK 分发<br/>状态：触发 data/control trace"]
+    B --> C["HomaRecvScheduler::ReceivePacket()<br/>作用：接收端主入口，同时驱动 Homa 接收逻辑和 SIRD credit loop<br/>状态：m_busySenders, sender/global budget, credit-in-use, CE/CSN 统计"]
 
-    F --> N["HomaInboundMsg::IsFullyReceived()<br/>作用: 判断消息是否完整接收<br/>修改: 无"]
-    N -->|是| O["HomaRecvScheduler::ForwardUp()<br/>作用: 上交应用，并回 ACK<br/>修改: 调用 ClearStateForMsg 清理接收侧消息"]
-    O --> P["HomaL4Protocol::ForwardUp()<br/>作用: 把重组后的完整 message 交给接收端应用<br/>修改: 触发 m_msgFinishTrace"]
-    O --> Q["HomaInboundMsg::GenerateGrantOrAck(ACK)<br/>作用: 生成 ACK 控制包<br/>修改: 无额外核心状态"]
-    Q --> R["HomaL4Protocol::SendDown()<br/>作用: 把 ACK 发回发送端<br/>修改: m_nextTimeTxQueWillBeEmpty"]
-    O --> S["HomaRecvScheduler::ClearStateForMsg()<br/>作用: 删除 inbound message 并取消重传定时器<br/>修改: m_inboundMsgs；取消 rtxEvent"]
+    C --> D["HomaRecvScheduler::ReceiveDataPacket()<br/>作用：把 DATA 归并到对应 inbound message<br/>状态：m_inboundMsgs 可能新增或重排"]
+    D --> E["HomaRecvScheduler::FindInboundMsg()<br/>作用：按五元组 + txMsgId 查找活跃消息<br/>状态：只读 m_inboundMsgs"]
+    D --> F["HomaInboundMsg::HomaInboundMsg()<br/>作用：首包到来时创建接收侧消息状态<br/>状态：m_receivedPackets, m_maxGrantableIdx, m_maxGrantedIdx, m_hasGrantedData, m_creditDrivenGrantWindow, m_lastRtxGrntIdx"]
+    D --> G["HomaInboundMsg::ReceiveDataPacket()<br/>作用：记录已收到分片，必要时推进 grantable window<br/>状态：m_receivedPackets, m_remainingBytes, m_packets/m_pktSizes, m_maxGrantableIdx"]
+    G --> H["HomaInboundMsg::IsFullyReceived()<br/>作用：判断消息是否已完整接收<br/>状态：只读 m_receivedPackets"]
+    H -->|否| I["HomaRecvScheduler::RescheduleInboundMsg()<br/>作用：按 SRPT 或 SRR 重新排列活跃消息顺序<br/>状态：m_inboundMsgs"]
+    I --> J["HomaRecvScheduler::EnsureCreditTickScheduled()<br/>作用：若仍有 grant opportunity，则安排 credit tick<br/>状态：m_creditTickEvent"]
+    J --> K["HomaRecvScheduler::CreditTick()<br/>作用：按一个 full-data-packet 发送时间周期性尝试发放 credit<br/>状态：m_creditTickEvent"]
+    K --> L["HomaRecvScheduler::IssuePendingGrants()<br/>作用：扫描活跃消息，决定当前允许给谁发 GRANT<br/>状态：m_sirdSenderCreditsInUsePkts, m_sirdGlobalCreditsInUsePkts, inboundMsg::m_currentlyScheduled, SRR cursor"]
+    L --> M["HomaInboundMsg::AdvanceGrantableWindow()<br/>作用：把一笔新的 receiver credit 转化为更大的 grantable boundary<br/>状态：m_maxGrantableIdx"]
+    L --> N["HomaInboundMsg::GenerateGrantOrAck(GRANT)<br/>作用：生成 GRANT 并同步已授权边界<br/>状态：m_prio, m_maxGrantedIdx, m_hasGrantedData"]
+    N --> O["HomaL4Protocol::SendDown()<br/>作用：把 GRANT 发回发送端<br/>状态：m_nextTimeTxQueWillBeEmpty"]
 
-    T["HomaRecvScheduler::ExpireRtxTimeout()<br/>作用: 接收端超时重传逻辑<br/>修改: inboundMsg::m_numRtxWithoutProgress, m_lastRtxGrntIdx；必要时发送 RESEND 或清理消息"] -.-> Q
-    S -. "若消息未完成则保留，等待后续 DATA 或超时" .-> T
+    H -->|是| P["HomaRecvScheduler::ForwardUp()<br/>作用：重组后上交应用，并回 ACK<br/>状态：随后调用 RemoveInboundMsg() 清理"]
+    P --> Q["HomaL4Protocol::ForwardUp()<br/>作用：把完整 message 交给 socket / 应用<br/>状态：触发 m_msgFinishTrace"]
+    P --> R["HomaInboundMsg::GenerateGrantOrAck(ACK)<br/>作用：生成 ACK 控制包<br/>状态：不推进授权边界"]
+    R --> S["HomaL4Protocol::SendDown()<br/>作用：把 ACK 发回发送端<br/>状态：m_nextTimeTxQueWillBeEmpty"]
+    P --> T["HomaRecvScheduler::RemoveInboundMsg()<br/>作用：移除活跃消息并取消重传定时器<br/>状态：m_inboundMsgs, rtxEvent"]
+
+    U["HomaRecvScheduler::ExpireRtxTimeout()<br/>作用：超时后生成 RESEND，或在长期无进展时删除消息<br/>状态：m_numRtxWithoutProgress, m_lastRtxGrntIdx"] -.-> V["HomaInboundMsg::GenerateResends()<br/>作用：根据缺口位图批量生成 RESEND<br/>状态：读 m_receivedPackets, m_maxGrantedIdx"]
+    V -.-> S
 
     classDef receiver fill:#eefaf1,stroke:#2d8a57,stroke-width:1px,color:#111;
     classDef network fill:#fff6e8,stroke:#d88900,stroke-width:1px,color:#111;
     class A network;
-    class B,C,D,E,F,G,H,I,J,K,L,M,N,O,P,Q,R,S,T receiver;
+    class B,C,D,E,F,G,H,I,J,K,L,M,N,O,P,Q,R,S,T,U,V receiver;
 ```
 
-### 接收端图怎么读
+### 接收端调用链说明
 
-1. 所有 `DATA/BUSY` 包先进入 `HomaL4Protocol::Receive()`，再进入 `HomaRecvScheduler::ReceivePacket()`。
-2. `ReceivePacket()` 里有两层逻辑：
-   - 普通 Homa 接收流程：把 DATA 交给 `ReceiveDataPacket()`。
-   - SIRD 控制流程：读取 `CE/CSN`，回收 credit，更新 sender/global budget 和 credit-in-use 计数。
-3. `HomaInboundMsg::ReceiveDataPacket()` 负责更新“这个 message 已经收到了哪些 packet”。
-4. 接收端随后通过 `ScheduleMsgAtIdx()` 决定 active message 的顺序。`UseSrrScheduling=false` 时偏 SRPT；`true` 时偏 SRR/FIFO。
-5. `CreditTick()` 和 `SendAppropriateGrants()` 构成 receiver-driven credit 核心闭环。
-6. `SendAppropriateGrants()` 决定是否给某个 sender 发一个新的 GRANT，同时增加：
-   - `m_sirdSenderCreditsInUsePkts[sender]`
-   - `m_sirdGlobalCreditsInUsePkts`
-7. 消息完整后，`ForwardUp()` 会把重组结果交给应用，再发 ACK，并清理 `HomaInboundMsg`。
-8. 如果消息长时间没有进展，`ExpireRtxTimeout()` 会发 `RESEND` 或最终清理状态。
+1. `HomaL4Protocol::Receive()` 统一完成 Homa 头解析和分发：
+   - `DATA/BUSY` 交给 `HomaRecvScheduler::ReceivePacket()`
+   - `GRANT/RESEND/ACK` 交给发送端 `HomaSendScheduler`
+2. `HomaRecvScheduler::ReceivePacket()` 不只是“收 DATA”。它还负责 SIRD 控制环：
+   - 根据收到的 DATA 回收 credit
+   - 更新每个 sender 的网络侧与主机侧预算
+   - 维护 sender/global credit-in-use
+   - 调度 `EnsureCreditTickScheduled()`
+3. `ReceiveDataPacket()` 先尝试 `FindInboundMsg()`；如果找不到，说明这是该消息的首包，需要创建新的 `HomaInboundMsg`。
+4. `HomaInboundMsg` 内部维护两条边界：
+   - `m_maxGrantableIdx`：接收端当前“最多愿意放开到哪里”
+   - `m_maxGrantedIdx`：已经通过 `GRANT` 真正告诉发送端“你可以发到哪里”
+5. 消息未完成时，接收端并不会立刻 GRANT，而是先 `RescheduleInboundMsg()`，然后通过 `CreditTick()` -> `IssuePendingGrants()` 的闭环决定何时、给谁、发多少。
+6. `IssuePendingGrants()` 是接收端 credit control 的核心：
+   - 非 SIRD 模式：按 overcommit + busy sender 规则给 `GRANT`
+   - SIRD 模式：同时受 sender budget、global budget、`m_sirdSenderCreditsInUsePkts`、`m_sirdGlobalCreditsInUsePkts` 限制
+7. 消息完整后，`ForwardUp()` 会：
+   - 调用 `HomaL4Protocol::ForwardUp()` 把重组结果交给应用
+   - 发送 `ACK`
+   - 调用 `RemoveInboundMsg()` 删除本地消息状态
+8. 如果消息长期没有新的接收进展，`ExpireRtxTimeout()` 会生成 `RESEND`；如果超时次数过多，直接删除该消息状态。
 
-## 3. 论文里怎么用这两张图
+## 3. 三条最重要的逻辑线
 
-建议把这两张图分别叫：
+### 3.1 数据发送主线
 
-- `图 X 发送端 Homa/SIRD 函数调用流程`
-- `图 Y 接收端 Homa/SIRD 函数调用流程`
+`Send()` -> `ScheduleNewMsg()` -> `TxDataPacket()` -> `GetNextPacket()` -> `SendDown()`
 
-正文中的一句话可以这样写：
+这是“真正把 DATA 发出去”的主线。
 
-> 图 X 和图 Y 分别展示了 Homa/SIRD 在发送端和接收端的主函数调用链。发送端流程围绕 `HomaOutboundMsg` 与 `HomaSendScheduler` 展开，负责消息分片、授权窗口推进和数据发送；接收端流程围绕 `HomaInboundMsg` 与 `HomaRecvScheduler` 展开，负责消息重组、GRANT 分配以及 SIRD credit control 状态更新。
+### 3.2 授权控制主线
 
-如果你后面要，我可以继续把这两张 Mermaid 图整理成更适合论文排版的 `draw.io` 风格分层框图版本。
+接收端：
+
+`ReceivePacket()` -> `ReceiveDataPacket()` -> `RescheduleInboundMsg()` -> `EnsureCreditTickScheduled()` -> `CreditTick()` -> `IssuePendingGrants()` -> `GenerateGrantOrAck(GRANT)` -> `SendDown()`
+
+发送端：
+
+`Receive()` -> `HandleControlPacketForOutboundMsg()` -> `HandleGrantOffset()`
+
+这是 receiver-driven Homa/SIRD 的核心闭环。
+
+### 3.3 缺口恢复主线
+
+接收端：
+
+`ExpireRtxTimeout()` -> `GenerateResends()` -> `SendDown()`
+
+发送端：
+
+`Receive()` -> `HandleControlPacketForOutboundMsg()` -> `HandleResend()` -> `TxDataPacket()`
+
+这是 “发现缺包 -> 请求重传 -> 重新发送” 的主线。
+
+## 4. 论文或汇报里怎么引用
+
+如果你想在正文里用一段话概括这两张图，可以直接写：
+
+> 图 X 和图 Y 分别展示了当前 Homa/SIRD 实现中发送端与接收端的主函数调用链。发送端围绕 `HomaOutboundMsg` 与 `HomaSendScheduler` 展开，负责消息分片、授权窗口推进以及数据发送；接收端围绕 `HomaInboundMsg` 与 `HomaRecvScheduler` 展开，负责消息归并、credit 分配、GRANT/ACK 生成以及缺口恢复。
+
+如果你口头讲图，建议只抓住三个词：
+
+- `数据主线`
+- `授权主线`
+- `重传主线`
+
+这样最容易讲清楚，不会陷进每个 helper 的细节里。

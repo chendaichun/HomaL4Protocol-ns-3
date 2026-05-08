@@ -33,6 +33,9 @@
 #include "ns3/ipv4-global-routing-helper.h"
 #include "ns3/network-module.h"
 #include "ns3/point-to-point-module.h"
+#include "ns3/point-to-point-net-device.h"
+#include "ns3/queue.h"
+#include "ns3/rpc-workload-app.h"
 #include "ns3/traffic-control-module.h"
 
 using namespace ns3;
@@ -45,15 +48,203 @@ struct WorkloadSpec
   std::map<double, int> msgSizeCdf;
 };
 
-static uint64_t g_completedBytes = 0;
+enum class MessageRole
+{
+  kRequest,
+  kResponse,
+  kOther
+};
+
+struct GoodputCounters
+{
+  uint64_t requestBytes = 0;
+  uint64_t responseBytes = 0;
+  uint64_t totalBytes = 0;
+};
+
+struct GoodputCheckpoint
+{
+  uint64_t requestBytes = 0;
+  uint64_t responseBytes = 0;
+  uint64_t totalBytes = 0;
+};
+
+static uint16_t g_rpcServerPort = 0;
+static GoodputCounters g_goodputCounters;
 
 struct QueueSampleTarget
 {
   std::string label;
+  std::string role;
+  uint32_t torIdx = 0;
+  int32_t hostIdx = -1;
+  int32_t spineIdx = -1;
   Ptr<QueueDisc> queueDisc;
+  Ptr<Queue<Packet>> deviceQueue;
+  bool active = false;
+  uint32_t peakCombinedBytes = 0;
+  uint32_t peakCombinedPackets = 0;
+  int64_t peakTimeNs = -1;
 };
 
 static std::vector<QueueSampleTarget> g_torEgressQueueTargets;
+static Time g_queueActiveStart = Seconds (0);
+static Time g_queueActiveEnd = Seconds (0);
+static bool g_torQueueIncludeDevice = false;
+
+static MessageRole
+ClassifyMessageRole (uint16_t sport, uint16_t dport)
+{
+  if (g_rpcServerPort == 0)
+    {
+      return MessageRole::kOther;
+    }
+  if (dport == g_rpcServerPort)
+    {
+      return MessageRole::kRequest;
+    }
+  if (sport == g_rpcServerPort)
+    {
+      return MessageRole::kResponse;
+    }
+  return MessageRole::kOther;
+}
+
+static const char*
+MessageRoleToString (MessageRole role)
+{
+  switch (role)
+    {
+    case MessageRole::kRequest:
+      return "request";
+    case MessageRole::kResponse:
+      return "response";
+    case MessageRole::kOther:
+    default:
+      return "other";
+    }
+}
+
+static uint32_t
+GetTrackedQueueBytes (const QueueSampleTarget& target)
+{
+  uint32_t qdiscBytes = target.queueDisc ? target.queueDisc->GetNBytes () : 0;
+  if (!g_torQueueIncludeDevice)
+    {
+      return qdiscBytes;
+    }
+  uint32_t deviceBytes = target.deviceQueue ? target.deviceQueue->GetNBytes () : 0;
+  return qdiscBytes + deviceBytes;
+}
+
+static uint32_t
+GetTrackedQueuePackets (const QueueSampleTarget& target)
+{
+  uint32_t qdiscPackets = target.queueDisc ? target.queueDisc->GetNPackets () : 0;
+  if (!g_torQueueIncludeDevice)
+    {
+      return qdiscPackets;
+    }
+  uint32_t devicePackets = target.deviceQueue ? target.deviceQueue->GetNPackets () : 0;
+  return qdiscPackets + devicePackets;
+}
+
+static void
+UpdateQueuePeak (QueueSampleTarget& target)
+{
+  if (!target.active)
+    {
+      return;
+    }
+
+  Time now = Simulator::Now ();
+  if (now < g_queueActiveStart || now > g_queueActiveEnd)
+    {
+      return;
+    }
+
+  uint32_t combinedBytes = GetTrackedQueueBytes (target);
+  uint32_t combinedPackets = GetTrackedQueuePackets (target);
+
+  if (combinedBytes >= target.peakCombinedBytes)
+    {
+      target.peakCombinedBytes = combinedBytes;
+      target.peakCombinedPackets = combinedPackets;
+      target.peakTimeNs = now.GetNanoSeconds ();
+    }
+}
+
+static void
+OnQueueDiscDepthChanged (std::size_t targetIdx, uint32_t oldValue, uint32_t newValue)
+{
+  (void) oldValue;
+  (void) newValue;
+  UpdateQueuePeak (g_torEgressQueueTargets[targetIdx]);
+}
+
+static void
+OnDeviceQueueDepthChanged (std::size_t targetIdx, uint32_t oldValue, uint32_t newValue)
+{
+  (void) oldValue;
+  (void) newValue;
+  UpdateQueuePeak (g_torEgressQueueTargets[targetIdx]);
+}
+
+static void
+AttachQueuePeakCallbacks ()
+{
+  for (std::size_t i = 0; i < g_torEgressQueueTargets.size (); ++i)
+    {
+      auto& target = g_torEgressQueueTargets[i];
+      if (target.queueDisc)
+        {
+          target.queueDisc->TraceConnectWithoutContext ("BytesInQueue",
+                                                        MakeBoundCallback (&OnQueueDiscDepthChanged, i));
+        }
+      if (target.deviceQueue)
+        {
+          target.deviceQueue->TraceConnectWithoutContext ("BytesInQueue",
+                                                          MakeBoundCallback (&OnDeviceQueueDepthChanged, i));
+        }
+      UpdateQueuePeak (target);
+    }
+}
+
+static void
+ConfigureActiveTorQueueTargets (const std::string& trafficConfig, int32_t incastReceiver)
+{
+  for (auto& target : g_torEgressQueueTargets)
+    {
+      target.active = false;
+    }
+
+  if (trafficConfig == "balanced")
+    {
+      for (auto& target : g_torEgressQueueTargets)
+        {
+          target.active = (target.role == "tor_to_host");
+        }
+      return;
+    }
+
+  if (trafficConfig == "core")
+    {
+      for (auto& target : g_torEgressQueueTargets)
+        {
+          target.active = (target.role == "tor_to_spine");
+        }
+      return;
+    }
+
+  if (trafficConfig == "incast")
+    {
+      for (auto& target : g_torEgressQueueTargets)
+        {
+          target.active = (target.role == "tor_to_host" && target.hostIdx == incastReceiver);
+        }
+      return;
+    }
+}
 
 static void
 TraceMsgBegin (Ptr<OutputStreamWrapper> stream,
@@ -64,11 +255,14 @@ TraceMsgBegin (Ptr<OutputStreamWrapper> stream,
                uint16_t dport,
                int txMsgId)
 {
+  MessageRole role = ClassifyMessageRole (sport, dport);
   *stream->GetStream () << "+ " << Simulator::Now ().GetNanoSeconds ()
                         << " " << msg->GetSize ()
                         << " " << saddr << ":" << sport
                         << " " << daddr << ":" << dport
-                        << " " << txMsgId << std::endl;
+                        << " " << txMsgId
+                        << " kind=" << MessageRoleToString (role)
+                        << std::endl;
 }
 
 static void
@@ -80,72 +274,163 @@ TraceMsgFinish (Ptr<OutputStreamWrapper> stream,
                 uint16_t dport,
                 int txMsgId)
 {
-  g_completedBytes += msg->GetSize ();
+  MessageRole role = ClassifyMessageRole (sport, dport);
+  g_goodputCounters.totalBytes += msg->GetSize ();
+  if (role == MessageRole::kRequest)
+    {
+      g_goodputCounters.requestBytes += msg->GetSize ();
+    }
+  else if (role == MessageRole::kResponse)
+    {
+      g_goodputCounters.responseBytes += msg->GetSize ();
+    }
   *stream->GetStream () << "- " << Simulator::Now ().GetNanoSeconds ()
                         << " " << msg->GetSize ()
                         << " " << saddr << ":" << sport
                         << " " << daddr << ":" << dport
-                        << " " << txMsgId << std::endl;
+                        << " " << txMsgId
+                        << " kind=" << MessageRoleToString (role)
+                        << std::endl;
 }
 
 static void
-SampleAggregateGoodput (Ptr<OutputStreamWrapper> stream,
-                        Time sampleInterval,
-                        uint64_t* lastBytes)
+SampleGoodput (Ptr<OutputStreamWrapper> stream,
+               Time sampleInterval,
+               GoodputCheckpoint* checkpoint,
+               uint32_t numHosts)
 {
-  uint64_t deltaBytes = g_completedBytes - *lastBytes;
-  *lastBytes = g_completedBytes;
+  uint64_t deltaRequestBytes = g_goodputCounters.requestBytes - checkpoint->requestBytes;
+  uint64_t deltaResponseBytes = g_goodputCounters.responseBytes - checkpoint->responseBytes;
+  uint64_t deltaTotalBytes = g_goodputCounters.totalBytes - checkpoint->totalBytes;
+  checkpoint->requestBytes = g_goodputCounters.requestBytes;
+  checkpoint->responseBytes = g_goodputCounters.responseBytes;
+  checkpoint->totalBytes = g_goodputCounters.totalBytes;
 
-  double goodputGbps = (deltaBytes * 8.0) / sampleInterval.GetSeconds () / 1e9;
+  // Paper-facing goodput is request payload throughput only.
+  double aggregateGoodputGbps = (deltaRequestBytes * 8.0) / sampleInterval.GetSeconds () / 1e9;
+  double responseGoodputGbps = (deltaResponseBytes * 8.0) / sampleInterval.GetSeconds () / 1e9;
+  double totalTransportGoodputGbps = (deltaTotalBytes * 8.0) / sampleInterval.GetSeconds () / 1e9;
+  double perHostGoodputGbps = 0.0;
+  if (numHosts > 0)
+    {
+      perHostGoodputGbps = aggregateGoodputGbps / numHosts;
+    }
   *stream->GetStream () << Simulator::Now ().GetNanoSeconds ()
-                        << " goodputGbps=" << goodputGbps
-                        << " completedBytes=" << g_completedBytes
+                        << " goodputGbps=" << aggregateGoodputGbps
+                        << " aggregateGoodputGbps=" << aggregateGoodputGbps
+                        << " perHostGoodputGbps=" << perHostGoodputGbps
+                        << " requestGoodputGbps=" << aggregateGoodputGbps
+                        << " responseGoodputGbps=" << responseGoodputGbps
+                        << " totalTransportGoodputGbps=" << totalTransportGoodputGbps
+                        << " completedBytes=" << g_goodputCounters.requestBytes
+                        << " requestCompletedBytes=" << g_goodputCounters.requestBytes
+                        << " responseCompletedBytes=" << g_goodputCounters.responseBytes
+                        << " totalCompletedBytes=" << g_goodputCounters.totalBytes
+                        << " numHosts=" << numHosts
                         << std::endl;
 
   Simulator::Schedule (sampleInterval,
-                       &SampleAggregateGoodput,
+                       &SampleGoodput,
                        stream,
                        sampleInterval,
-                       lastBytes);
+                       checkpoint,
+                       numHosts);
 }
 
 static void
 SampleTorQueues (Ptr<OutputStreamWrapper> stream, Time sampleInterval)
 {
+  uint64_t totalBytes = 0;
   uint64_t totalPackets = 0;
+  uint64_t maxBytes = 0;
   uint64_t maxPackets = 0;
+  uint32_t activeQueues = 0;
 
   for (const auto& target : g_torEgressQueueTargets)
     {
-      uint64_t packets = target.queueDisc->GetNPackets ();
-      uint64_t bytes = target.queueDisc->GetNBytes ();
+      if (!target.active)
+        {
+          continue;
+        }
+
+      uint64_t qdiscPackets = target.queueDisc ? target.queueDisc->GetNPackets () : 0;
+      uint64_t qdiscBytes = target.queueDisc ? target.queueDisc->GetNBytes () : 0;
+      uint64_t devicePackets = target.deviceQueue ? target.deviceQueue->GetNPackets () : 0;
+      uint64_t deviceBytes = target.deviceQueue ? target.deviceQueue->GetNBytes () : 0;
+      uint64_t packets = GetTrackedQueuePackets (target);
+      uint64_t bytes = GetTrackedQueueBytes (target);
+      totalBytes += bytes;
       totalPackets += packets;
+      maxBytes = std::max (maxBytes, bytes);
       maxPackets = std::max (maxPackets, packets);
+      activeQueues++;
 
       *stream->GetStream () << Simulator::Now ().GetNanoSeconds ()
                             << " queue=" << target.label
+                            << " role=" << target.role
                             << " packets=" << packets
                             << " bytes=" << bytes
+                            << " qdiscPackets=" << qdiscPackets
+                            << " qdiscBytes=" << qdiscBytes
+                            << " devicePackets=" << devicePackets
+                            << " deviceBytes=" << deviceBytes
                             << std::endl;
     }
 
+  double meanBytes = 0.0;
   double meanPackets = 0.0;
-  if (!g_torEgressQueueTargets.empty ())
+  if (activeQueues > 0)
     {
-      meanPackets = static_cast<double> (totalPackets) / g_torEgressQueueTargets.size ();
+      meanBytes = static_cast<double> (totalBytes) / activeQueues;
+      meanPackets = static_cast<double> (totalPackets) / activeQueues;
     }
 
   *stream->GetStream () << Simulator::Now ().GetNanoSeconds ()
                         << " queue=aggregate"
+                        << " maxBytes=" << maxBytes
+                        << " meanBytes=" << meanBytes
                         << " maxPackets=" << maxPackets
                         << " meanPackets=" << meanPackets
-                        << " numQueues=" << g_torEgressQueueTargets.size ()
+                        << " numQueues=" << activeQueues
                         << std::endl;
 
   Simulator::Schedule (sampleInterval,
                        &SampleTorQueues,
                        stream,
                        sampleInterval);
+}
+
+static void
+WriteTorQueuePeakSummary (Ptr<OutputStreamWrapper> stream)
+{
+  uint32_t maxPeakBytes = 0;
+  uint32_t maxPeakPackets = 0;
+  uint32_t activeQueues = 0;
+
+  for (const auto& target : g_torEgressQueueTargets)
+    {
+      if (!target.active)
+        {
+          continue;
+        }
+      activeQueues++;
+      maxPeakBytes = std::max (maxPeakBytes, target.peakCombinedBytes);
+      maxPeakPackets = std::max (maxPeakPackets, target.peakCombinedPackets);
+      *stream->GetStream () << Simulator::Now ().GetNanoSeconds ()
+                            << " queue=" << target.label
+                            << " role=" << target.role
+                            << " peakBytes=" << target.peakCombinedBytes
+                            << " peakPackets=" << target.peakCombinedPackets
+                            << " peakTimeNs=" << target.peakTimeNs
+                            << std::endl;
+    }
+
+  *stream->GetStream () << Simulator::Now ().GetNanoSeconds ()
+                        << " queue=aggregate"
+                        << " peakBytes=" << maxPeakBytes
+                        << " peakPackets=" << maxPeakPackets
+                        << " numQueues=" << activeQueues
+                        << std::endl;
 }
 
 static void
@@ -277,6 +562,10 @@ main (int argc, char* argv[])
   double offeredLoad = 0.5;
   double startSec = 0.2;
   double durationSec = 1.0;
+  double trafficStartSec = -1.0;
+  double trafficDurationSec = -1.0;
+  double traceStartSec = -1.0;
+  double traceDurationSec = -1.0;
   double settleTailSec = 0.2;
 
   uint32_t nHosts = 144;
@@ -290,6 +579,8 @@ main (int argc, char* argv[])
   std::string torSpineDelay = "1us";
 
   uint32_t appPort = 30000;
+  uint32_t clientPortBase = 50000;
+  uint32_t rpcResponseBytes = 20;
   uint32_t bdpBytes = 100000;
   uint32_t payloadSizeBytes = 1442;
   int32_t homaBdpPkts = -1;
@@ -305,9 +596,11 @@ main (int argc, char* argv[])
   std::string deviceQueueMaxSize = "2000p";
   std::string qdiscMaxSize = "1000p";
   std::string qdiscMarkThreshold = "";
+  bool torQueueIncludeDevice = false;
 
   bool traceMsg = true;
   bool traceTorQueue = true;
+  bool traceTorQueueSeries = false;
   bool traceGoodput = true;
   uint64_t queueSampleUs = 100;
   uint64_t goodputSampleUs = 100;
@@ -328,10 +621,15 @@ main (int argc, char* argv[])
   cmd.AddValue ("offeredLoad", "Per-host offered load fraction for background all-to-all traffic", offeredLoad);
   cmd.AddValue ("startSec", "Background traffic start time", startSec);
   cmd.AddValue ("durationSec", "Traffic generation duration", durationSec);
+  cmd.AddValue ("trafficStartSec", "Explicit background traffic start time; negative falls back to startSec", trafficStartSec);
+  cmd.AddValue ("trafficDurationSec", "Explicit traffic generation duration; negative falls back to durationSec", trafficDurationSec);
+  cmd.AddValue ("traceStartSec", "Explicit stats window start time; negative falls back to startSec", traceStartSec);
+  cmd.AddValue ("traceDurationSec", "Explicit stats window duration; negative falls back to durationSec", traceDurationSec);
   cmd.AddValue ("settleTailSec", "Drain time after traffic stop", settleTailSec);
   cmd.AddValue ("torSpineRateGbps", "Override ToR-Spine rate in Gbps; <=0 uses trafficConfig default", torSpineRateGbps);
   cmd.AddValue ("traceMsg", "Trace message begin/finish", traceMsg);
   cmd.AddValue ("traceTorQueue", "Sample ToR egress queues over time", traceTorQueue);
+  cmd.AddValue ("traceTorQueueSeries", "When true, also write ToR queue time series in addition to peak summary", traceTorQueueSeries);
   cmd.AddValue ("traceGoodput", "Sample aggregate application-level goodput", traceGoodput);
   cmd.AddValue ("queueSampleUs", "ToR queue sampling period in microseconds", queueSampleUs);
   cmd.AddValue ("goodputSampleUs", "Goodput sampling period in microseconds", goodputSampleUs);
@@ -340,6 +638,8 @@ main (int argc, char* argv[])
   cmd.AddValue ("incastLoadFraction", "Aggregate incast overlay load fraction relative to total background offered load", incastLoadFraction);
   cmd.AddValue ("incastReceiverIdx", "Receiver host index for incast; negative chooses random receiver", incastReceiverIdx);
   cmd.AddValue ("incastSeed", "Seed for deterministic incast sender/receiver selection", incastSeed);
+  cmd.AddValue ("clientPortBase", "Base port for background RPC client sockets", clientPortBase);
+  cmd.AddValue ("rpcResponseBytes", "Response size in bytes for background RPC replies", rpcResponseBytes);
   cmd.AddValue ("bdpBytes", "Paper sim1 RTT BDP in bytes; defaults to 100KB from Table 2", bdpBytes);
   cmd.AddValue ("payloadSizeBytes", "Payload bytes represented by one workload packet unit", payloadSizeBytes);
   cmd.AddValue ("rttPkts", "RTT BDP in packets; negative derives from bdpBytes/payloadSizeBytes", homaBdpPkts);
@@ -354,6 +654,7 @@ main (int argc, char* argv[])
   cmd.AddValue ("deviceQueueMaxSize", "PointToPointNetDevice TxQueue MaxSize", deviceQueueMaxSize);
   cmd.AddValue ("qdiscMaxSize", "SirdQueueDisc MaxSize", qdiscMaxSize);
   cmd.AddValue ("qdiscMarkThreshold", "SirdQueueDisc ECN mark threshold", qdiscMarkThreshold);
+  cmd.AddValue ("torQueueIncludeDevice", "When true, count device TxQueue occupancy on top of the ToR queue; false keeps strict queue-only semantics", torQueueIncludeDevice);
   cmd.Parse (argc, argv);
 
   if (nTors * hostsPerTor != nHosts)
@@ -371,6 +672,31 @@ main (int argc, char* argv[])
   if (payloadSizeBytes == 0 || bdpBytes == 0)
     {
       NS_FATAL_ERROR ("payloadSizeBytes and bdpBytes must be positive.");
+    }
+  if (clientPortBase + nHosts >= 65535)
+    {
+      NS_FATAL_ERROR ("clientPortBase leaves insufficient room for per-host background RPC ports.");
+    }
+  g_torQueueIncludeDevice = torQueueIncludeDevice;
+  g_rpcServerPort = static_cast<uint16_t> (appPort);
+  g_goodputCounters = GoodputCounters ();
+
+  const double effectiveTrafficStartSec = (trafficStartSec >= 0.0) ? trafficStartSec : startSec;
+  const double effectiveTrafficDurationSec = (trafficDurationSec >= 0.0) ? trafficDurationSec : durationSec;
+  const double effectiveTraceStartSec = (traceStartSec >= 0.0) ? traceStartSec : startSec;
+  const double effectiveTraceDurationSec = (traceDurationSec >= 0.0) ? traceDurationSec : durationSec;
+  if (effectiveTrafficDurationSec <= 0.0 || effectiveTraceDurationSec <= 0.0)
+    {
+      NS_FATAL_ERROR ("trafficDurationSec and traceDurationSec must be positive after fallback resolution.");
+    }
+  if (effectiveTraceStartSec < effectiveTrafficStartSec)
+    {
+      NS_FATAL_ERROR ("traceStartSec must be greater than or equal to trafficStartSec.");
+    }
+  if (effectiveTraceStartSec + effectiveTraceDurationSec >
+      effectiveTrafficStartSec + effectiveTrafficDurationSec + 1e-12)
+    {
+      NS_FATAL_ERROR ("trace window must lie within the traffic generation window.");
     }
 
   const int32_t derivedBdpPkts = std::max<int32_t> (
@@ -519,9 +845,18 @@ main (int argc, char* argv[])
       QueueDiscContainer qdiscs = tch.Install (hostTorLinks[hostIdx]);
       hostTorQdiscs.push_back (qdiscs);
       uint32_t torIdx = hostIdx / hostsPerTor;
+      Ptr<PointToPointNetDevice> torDevice = DynamicCast<PointToPointNetDevice> (hostTorLinks[hostIdx].Get (1));
       std::ostringstream label;
       label << "tor" << torIdx << "_to_host" << hostIdx;
-      g_torEgressQueueTargets.push_back ({label.str (), qdiscs.Get (1)});
+      QueueSampleTarget target;
+      target.label = label.str ();
+      target.role = "tor_to_host";
+      target.torIdx = torIdx;
+      target.hostIdx = static_cast<int32_t> (hostIdx);
+      target.spineIdx = -1;
+      target.queueDisc = qdiscs.Get (1);
+      target.deviceQueue = torDevice ? torDevice->GetQueue () : nullptr;
+      g_torEgressQueueTargets.push_back (target);
     }
   for (uint32_t linkIdx = 0; linkIdx < torSpineLinks.size (); ++linkIdx)
     {
@@ -529,9 +864,18 @@ main (int argc, char* argv[])
       torSpineQdiscs.push_back (qdiscs);
       uint32_t torIdx = linkIdx / nSpines;
       uint32_t spineIdx = linkIdx % nSpines;
+      Ptr<PointToPointNetDevice> torDevice = DynamicCast<PointToPointNetDevice> (torSpineLinks[linkIdx].Get (0));
       std::ostringstream label;
       label << "tor" << torIdx << "_to_spine" << spineIdx;
-      g_torEgressQueueTargets.push_back ({label.str (), qdiscs.Get (0)});
+      QueueSampleTarget target;
+      target.label = label.str ();
+      target.role = "tor_to_spine";
+      target.torIdx = torIdx;
+      target.hostIdx = -1;
+      target.spineIdx = static_cast<int32_t> (spineIdx);
+      target.queueDisc = qdiscs.Get (0);
+      target.deviceQueue = torDevice ? torDevice->GetQueue () : nullptr;
+      g_torEgressQueueTargets.push_back (target);
     }
 
   Ipv4AddressHelper address;
@@ -568,48 +912,45 @@ main (int argc, char* argv[])
                                      MakeBoundCallback (&TraceMsgFinish, msgStream));
     }
 
-  if (traceTorQueue)
-    {
-      Ptr<OutputStreamWrapper> queueStream = ascii.CreateFileStream (prefix.str () + ".tor-egress-queue.tr");
-      Simulator::Schedule (MicroSeconds (queueSampleUs),
-                           &SampleTorQueues,
-                           queueStream,
-                           MicroSeconds (queueSampleUs));
-    }
-
   if (traceGoodput)
     {
       Ptr<OutputStreamWrapper> goodputStream = ascii.CreateFileStream (prefix.str () + ".goodput.tr");
-      uint64_t* lastBytes = new uint64_t (0);
+      GoodputCheckpoint* checkpoint = new GoodputCheckpoint ();
       Simulator::Schedule (MicroSeconds (goodputSampleUs),
-                           &SampleAggregateGoodput,
+                           &SampleGoodput,
                            goodputStream,
                            MicroSeconds (goodputSampleUs),
-                           lastBytes);
+                           checkpoint,
+                           nHosts);
     }
 
-  std::vector<InetSocketAddress> remoteClients;
-  remoteClients.reserve (nHosts);
+  std::vector<Ipv4Address> remoteHosts;
+  remoteHosts.reserve (nHosts);
   for (uint32_t hostIdx = 0; hostIdx < nHosts; ++hostIdx)
     {
-      remoteClients.emplace_back (hostIps[hostIdx], appPort);
+      remoteHosts.push_back (hostIps[hostIdx]);
     }
 
   double backgroundOfferedLoad = offeredLoad;
+  int32_t actualIncastReceiver = -1;
   if (trafficConfig == "incast")
     {
       backgroundOfferedLoad = offeredLoad * (1.0 - incastLoadFraction);
     }
 
-  std::vector<Ptr<MsgGeneratorApp>> backgroundApps;
+  std::vector<Ptr<RpcWorkloadApp>> backgroundApps;
   backgroundApps.reserve (nHosts);
   for (uint32_t hostIdx = 0; hostIdx < nHosts; ++hostIdx)
     {
-      Ptr<MsgGeneratorApp> app = CreateObject<MsgGeneratorApp> (hostIps[hostIdx], appPort);
-      app->Install (hosts.Get (hostIdx), remoteClients);
-      app->SetWorkload (backgroundOfferedLoad, workload.msgSizeCdf, workload.avgMsgSizePkts);
-      app->Start (Seconds (startSec));
-      app->Stop (Seconds (startSec + durationSec));
+      const uint16_t clientPort = static_cast<uint16_t> (clientPortBase + hostIdx);
+      Ptr<RpcWorkloadApp> app = CreateObject<RpcWorkloadApp> (hostIps[hostIdx],
+                                                              static_cast<uint16_t> (appPort),
+                                                              clientPort);
+      app->Install (hosts.Get (hostIdx), remoteHosts);
+      app->SetRequestWorkload (backgroundOfferedLoad, workload.msgSizeCdf, workload.avgMsgSizePkts);
+      app->SetResponseBytes (rpcResponseBytes);
+      app->Start (Seconds (effectiveTrafficStartSec));
+      app->Stop (Seconds (effectiveTrafficStartSec + effectiveTrafficDurationSec));
       backgroundApps.push_back (app);
     }
 
@@ -629,6 +970,7 @@ main (int argc, char* argv[])
           std::uniform_int_distribution<uint32_t> receiverDist (0, nHosts - 1);
           receiver = receiverDist (rng);
         }
+      actualIncastReceiver = static_cast<int32_t> (receiver);
 
       hostIndices.erase (std::remove (hostIndices.begin (), hostIndices.end (), receiver), hostIndices.end ());
       std::shuffle (hostIndices.begin (), hostIndices.end (), rng);
@@ -647,7 +989,7 @@ main (int argc, char* argv[])
 
       Time incastInterval = Seconds ((static_cast<double> (incastMsgBytes) * 8.0) /
                                      (perSenderGbps * 1e9));
-      Time stopTime = Seconds (startSec + durationSec);
+      Time stopTime = Seconds (effectiveTrafficStartSec + effectiveTrafficDurationSec);
 
       for (uint32_t i = 0; i < incastSenders; ++i)
         {
@@ -655,7 +997,7 @@ main (int argc, char* argv[])
           Ptr<SocketFactory> sFactory = hosts.Get (senderIdx)->GetObject<HomaSocketFactory> ();
           Ptr<Socket> senderSock = sFactory->CreateSocket ();
           senderSock->Bind (InetSocketAddress (hostIps[senderIdx], static_cast<uint16_t> (40000 + i)));
-          Simulator::Schedule (Seconds (startSec),
+          Simulator::Schedule (Seconds (effectiveTrafficStartSec),
                                &SendPeriodic,
                                senderSock,
                                InetSocketAddress (hostIps[receiver], appPort),
@@ -665,7 +1007,36 @@ main (int argc, char* argv[])
         }
     }
 
-  Simulator::Stop (Seconds (startSec + durationSec + settleTailSec));
+  if (trafficConfig != "incast")
+    {
+      actualIncastReceiver = -1;
+    }
+
+  ConfigureActiveTorQueueTargets (trafficConfig, actualIncastReceiver);
+  g_queueActiveStart = Seconds (effectiveTraceStartSec);
+  g_queueActiveEnd = Seconds (effectiveTraceStartSec + effectiveTraceDurationSec);
+  AttachQueuePeakCallbacks ();
+
+  const double simulationStopSec = std::max (effectiveTrafficStartSec + effectiveTrafficDurationSec,
+                                             effectiveTraceStartSec + effectiveTraceDurationSec) +
+                                   settleTailSec;
+  Simulator::Stop (Seconds (simulationStopSec));
+
+  if (traceTorQueue)
+    {
+      Ptr<OutputStreamWrapper> queueStream = ascii.CreateFileStream (prefix.str () + ".tor-egress-queue.tr");
+      if (traceTorQueueSeries)
+        {
+          Simulator::Schedule (Seconds (effectiveTraceStartSec),
+                               &SampleTorQueues,
+                               queueStream,
+                               MicroSeconds (queueSampleUs));
+        }
+      Simulator::Schedule (Seconds (simulationStopSec),
+                           &WriteTorQueuePeakSummary,
+                           queueStream);
+    }
+
   Simulator::Run ();
   Simulator::Destroy ();
   return 0;

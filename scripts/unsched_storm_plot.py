@@ -14,6 +14,11 @@ import matplotlib.pyplot as plt
 
 
 CASE_RE = re.compile(r"^n(?P<senders>\d+)_(?P<mode>.+)_load(?P<load>[0-9p.]+)$")
+MODE_STYLE = {
+    "unsched": {"color": "#c65d13", "marker": "o", "linestyle": "-", "label": "Unscheduled"},
+    "scheduled": {"color": "#1f6f8b", "marker": "s", "linestyle": "--", "label": "Scheduled"},
+}
+SENDER_COLORS = {8: "#1f6f8b", 16: "#6a4c93", 32: "#c65d13"}
 
 
 def parse_case_name(path: Path) -> Optional[Tuple[int, str, float]]:
@@ -146,6 +151,27 @@ def parse_receiver_queue(path: Path) -> Tuple[List[float], List[float]]:
     return times_ms, packets
 
 
+def mode_style(mode: str) -> Dict[str, str]:
+    return MODE_STYLE.get(
+        mode,
+        {"color": "#555555", "marker": "o", "linestyle": "-", "label": mode},
+    )
+
+
+def completion_ratio(row: Dict[str, object]) -> float:
+    started = int(row.get("short_started") or 0)
+    finished = int(row.get("short_finished") or 0)
+    if started <= 0:
+        return math.nan
+    return finished / started * 100.0
+
+
+def style_axes(ax: plt.Axes) -> None:
+    ax.grid(True, alpha=0.22, linewidth=0.8)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+
 def collect_rows(root: Path, short_size: int, long_size: int) -> List[Dict[str, object]]:
     rows: List[Dict[str, object]] = []
     for case_dir in sorted(p for p in root.iterdir() if p.is_dir()):
@@ -246,16 +272,59 @@ def plot_metric_vs_load(
     )
     for ax, senders in zip(axes[:, 0], senders_values):
         for mode, mode_rows in sorted(grouped(rows, senders).items()):
+            style = mode_style(mode)
             xs = [float(row["load_gbps"]) for row in mode_rows]
             ys = [
                 float(row[metric]) if row.get(metric) not in (None, "") else math.nan
                 for row in mode_rows
             ]
-            ax.plot(xs, ys, marker="o", label=mode)
-        ax.set_title(f"{title} (N={senders})")
+            ax.plot(
+                xs,
+                ys,
+                marker=style["marker"],
+                linestyle=style["linestyle"],
+                color=style["color"],
+                linewidth=2.0,
+                markersize=5.5,
+                label=style["label"],
+            )
+        ax.set_title(f"{title} (N={senders})", fontsize=12)
         ax.set_xlabel("Short-message aggregate offered load (Gbps)")
         ax.set_ylabel(ylabel)
-        ax.grid(True, alpha=0.3)
+        style_axes(ax)
+        ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+
+
+def plot_completion_ratio_vs_load(rows: List[Dict[str, object]], out_path: Path) -> None:
+    if not rows:
+        return
+    senders_values = sorted({int(row["senders"]) for row in rows})
+    fig, axes = plt.subplots(
+        len(senders_values), 1, figsize=(7.0, 3.5 * len(senders_values)), squeeze=False
+    )
+    for ax, senders in zip(axes[:, 0], senders_values):
+        for mode, mode_rows in sorted(grouped(rows, senders).items()):
+            style = mode_style(mode)
+            xs = [float(row["load_gbps"]) for row in mode_rows]
+            ys = [completion_ratio(row) for row in mode_rows]
+            ax.plot(
+                xs,
+                ys,
+                marker=style["marker"],
+                linestyle=style["linestyle"],
+                color=style["color"],
+                linewidth=2.0,
+                markersize=5.5,
+                label=style["label"],
+            )
+        ax.set_title(f"Short-message completion ratio (N={senders})", fontsize=12)
+        ax.set_xlabel("Short-message aggregate offered load (Gbps)")
+        ax.set_ylabel("Completion ratio (%)")
+        ax.set_ylim(-2, 105)
+        style_axes(ax)
         ax.legend()
     fig.tight_layout()
     fig.savefig(out_path, dpi=180)
@@ -277,19 +346,148 @@ def plot_queue_timeseries(root: Path, rows: List[Dict[str, object]], out_path: P
 
     fig, ax = plt.subplots(figsize=(8.0, 4.2))
     for row in sorted(selected, key=lambda r: str(r["mode"])):
+        style = mode_style(str(row["mode"]))
         case = str(row["case"])
         prefix = root / case / f"unsched_storm_{case}"
         times_ms, packets = parse_receiver_queue(prefix.with_suffix(".switch-egress-queue.tr"))
         if not times_ms:
             continue
-        ax.plot(times_ms, packets, label=str(row["mode"]))
+        ax.plot(
+            times_ms,
+            packets,
+            label=style["label"],
+            color=style["color"],
+            linestyle=style["linestyle"],
+            linewidth=2.0,
+        )
     ax.set_title(f"Receiver-facing queue time series (N={max_sender}, load={max_load:g}Gbps)")
     ax.set_xlabel("Simulation time (ms)")
     ax.set_ylabel("Queue occupancy (packets)")
-    ax.grid(True, alpha=0.3)
+    style_axes(ax)
     ax.legend()
     fig.tight_layout()
     fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+
+
+def select_rows(rows: List[Dict[str, object]], senders: int) -> List[Dict[str, object]]:
+    selected = [row for row in rows if int(row["senders"]) == senders]
+    selected.sort(key=lambda row: (str(row["mode"]), float(row["load_gbps"])))
+    return selected
+
+
+def plot_paper_overload_summary(rows: List[Dict[str, object]], out_path: Path, senders: int = 32) -> None:
+    selected = select_rows(rows, senders)
+    if not selected:
+        return
+
+    fig, axes = plt.subplots(1, 3, figsize=(13.2, 3.9))
+    metrics = [
+        ("peak_receiver_queue_pkts", "Peak queue (pkts)", (0, 1050)),
+        ("receiver_dropped_pkts", "Receiver drops (pkts)", None),
+        ("completion", "Completion ratio (%)", (-2, 105)),
+    ]
+
+    for ax, (metric, ylabel, ylim) in zip(axes, metrics):
+        for mode in ("unsched", "scheduled"):
+            mode_rows = [row for row in selected if str(row["mode"]) == mode]
+            if not mode_rows:
+                continue
+            style = mode_style(mode)
+            xs = [float(row["load_gbps"]) for row in mode_rows]
+            if metric == "completion":
+                ys = [completion_ratio(row) for row in mode_rows]
+            else:
+                ys = [float(row.get(metric) or 0.0) for row in mode_rows]
+            ax.plot(
+                xs,
+                ys,
+                color=style["color"],
+                linestyle=style["linestyle"],
+                marker=style["marker"],
+                linewidth=2.2,
+                markersize=6,
+                label=style["label"],
+            )
+        ax.set_xlabel("Offered load (Gbps)")
+        ax.set_ylabel(ylabel)
+        if ylim is not None:
+            ax.set_ylim(*ylim)
+        style_axes(ax)
+
+    axes[0].set_title(f"(a) Queue peak, N={senders}")
+    axes[1].set_title(f"(b) Receiver drops, N={senders}")
+    axes[2].set_title(f"(c) Message completion, N={senders}")
+
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=2, frameon=False, bbox_to_anchor=(0.5, 1.03))
+    fig.tight_layout(rect=(0, 0, 1, 0.93))
+    fig.savefig(out_path, dpi=220)
+    plt.close(fig)
+
+
+def plot_paper_tradeoff_summary(
+    root: Path, rows: List[Dict[str, object]], out_path: Path, senders: int = 32
+) -> None:
+    selected = select_rows(rows, senders)
+    if not selected:
+        return
+
+    highest_load = max(float(row["load_gbps"]) for row in selected)
+    time_series_rows = [
+        row for row in selected if float(row["load_gbps"]) == highest_load and str(row["mode"]) in MODE_STYLE
+    ]
+
+    fig, axes = plt.subplots(1, 2, figsize=(10.6, 3.9))
+
+    ax = axes[0]
+    for mode in ("unsched", "scheduled"):
+        mode_rows = [row for row in selected if str(row["mode"]) == mode]
+        if not mode_rows:
+            continue
+        style = mode_style(mode)
+        xs = [float(row["load_gbps"]) for row in mode_rows]
+        ys = [float(row.get("short_p99_us") or math.nan) for row in mode_rows]
+        ax.plot(
+            xs,
+            ys,
+            color=style["color"],
+            linestyle=style["linestyle"],
+            marker=style["marker"],
+            linewidth=2.2,
+            markersize=6,
+            label=style["label"],
+        )
+    ax.set_title(f"(a) Tail latency of completed short messages, N={senders}")
+    ax.set_xlabel("Offered load (Gbps)")
+    ax.set_ylabel("Short-message p99 FCT (us)")
+    style_axes(ax)
+
+    ax = axes[1]
+    for row in sorted(time_series_rows, key=lambda item: str(item["mode"])):
+        style = mode_style(str(row["mode"]))
+        case = str(row["case"])
+        prefix = root / case / f"unsched_storm_{case}"
+        times_ms, packets = parse_receiver_queue(prefix.with_suffix(".switch-egress-queue.tr"))
+        if not times_ms:
+            continue
+        ax.plot(
+            times_ms,
+            packets,
+            color=style["color"],
+            linestyle=style["linestyle"],
+            linewidth=2.0,
+            label=style["label"],
+        )
+    ax.set_title(f"(b) Receiver queue time series at {highest_load:g}Gbps, N={senders}")
+    ax.set_xlabel("Simulation time (ms)")
+    ax.set_ylabel("Queue occupancy (pkts)")
+    style_axes(ax)
+
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=2, frameon=False, bbox_to_anchor=(0.5, 1.03))
+    fig.tight_layout(rect=(0, 0, 1, 0.93))
+    fig.savefig(out_path, dpi=220)
     plt.close(fig)
 
 
@@ -326,6 +524,10 @@ def main() -> None:
         "Short-message p99 FCT (us)",
         "Short-message tail latency",
     )
+    plot_completion_ratio_vs_load(
+        rows,
+        args.out_dir / "short_completion_ratio_vs_load.png",
+    )
     plot_metric_vs_load(
         rows,
         args.out_dir / "long_p99_fct_vs_load.png",
@@ -337,6 +539,15 @@ def main() -> None:
         args.root,
         rows,
         args.out_dir / "receiver_queue_timeseries_highest_load.png",
+    )
+    plot_paper_overload_summary(
+        rows,
+        args.out_dir / "paper_overload_summary_n32.png",
+    )
+    plot_paper_tradeoff_summary(
+        args.root,
+        rows,
+        args.out_dir / "paper_tradeoff_summary_n32.png",
     )
 
 

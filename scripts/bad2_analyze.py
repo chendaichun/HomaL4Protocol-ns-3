@@ -4,6 +4,10 @@ import csv
 from pathlib import Path
 from statistics import mean
 
+MAIN_COLOR = "#1f6f8b"
+ACCENT_COLOR = "#c65d13"
+NEUTRAL_COLOR = "#666666"
+
 
 def parse_kv_file(path):
     data = {}
@@ -115,6 +119,12 @@ def read_receiver_queue(path, summary, warmup_fraction):
 
 def avg(values):
     return mean(values) if values else 0.0
+
+
+def style_axes(ax):
+    ax.grid(True, alpha=0.22, linewidth=0.8)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
 
 
 def summarize_case(summary_path, warmup_fraction):
@@ -255,14 +265,15 @@ def write_plots(out_dir, rows):
 
     plt.figure(figsize=(6.2, 4.0))
     plt.plot(xs, [row["aggregate_utilization"] * 100.0 for row in rows],
-             marker="o", label="aggregate utilization")
-    plt.axhline(100.0, color="0.45", linewidth=1.0, linestyle="--", label="100% bottleneck")
-    plt.axhline(baseline_utilization_pct, color="#2f6f9f", linewidth=1.0,
+             marker="o", linewidth=2.2, color=MAIN_COLOR, label="aggregate utilization")
+    plt.axhline(100.0, color=NEUTRAL_COLOR, linewidth=1.0, linestyle="--", label="100% bottleneck")
+    plt.axhline(baseline_utilization_pct, color=MAIN_COLOR, linewidth=1.0,
                 linestyle=":", label=f"0us baseline ({baseline_utilization_pct:.1f}%)")
     plt.xlabel("Sender A extra one-way delay (us)")
     plt.ylabel("Receiver bottleneck utilization (%)")
+    plt.xticks(xs, xs)
     plt.ylim(0, 110)
-    plt.grid(True, alpha=0.3)
+    style_axes(plt.gca())
     plt.legend()
     plt.tight_layout()
     plt.savefig(out_dir / "aggregate_utilization_vs_rtt.png", dpi=180)
@@ -271,18 +282,19 @@ def write_plots(out_dir, rows):
     plt.figure(figsize=(6.2, 4.0))
     utilization = [row["aggregate_utilization"] * 100.0 for row in rows]
     loss_vs_baseline = [baseline_utilization_pct - value for value in utilization]
-    plt.bar(xs, utilization, width=2.2, label="measured utilization")
-    plt.plot(xs, [baseline_utilization_pct for _ in rows], color="#2f6f9f",
+    plt.bar(xs, utilization, width=2.2, color=MAIN_COLOR, alpha=0.88, label="measured utilization")
+    plt.plot(xs, [baseline_utilization_pct for _ in rows], color=MAIN_COLOR,
              linewidth=1.5, linestyle=":", label=f"0us baseline ({baseline_utilization_pct:.1f}%)")
-    plt.plot(xs, [100.0 for _ in rows], color="0.35",
+    plt.plot(xs, [100.0 for _ in rows], color=NEUTRAL_COLOR,
              linewidth=1.0, linestyle="--", label="100% bottleneck")
     for x, value, loss in zip(xs, utilization, loss_vs_baseline):
         if loss > 0.5:
             plt.text(x, value + 2, f"-{loss:.1f}pp", ha="center", fontsize=8)
     plt.xlabel("Sender A extra one-way delay (us)")
     plt.ylabel("Receiver bottleneck utilization (%)")
+    plt.xticks(xs, xs)
     plt.ylim(0, 110)
-    plt.grid(True, axis="y", alpha=0.3)
+    style_axes(plt.gca())
     plt.legend()
     plt.tight_layout()
     plt.savefig(out_dir / "aggregate_utilization_baseline_comparison.png", dpi=180)
@@ -290,16 +302,17 @@ def write_plots(out_dir, rows):
 
     plt.figure(figsize=(6.2, 4.0))
     plt.plot(xs, [row["sender_a_goodput_gbps"] for row in rows],
-             marker="o", label="sender A (long RTT)")
+             marker="o", linewidth=2.2, color=ACCENT_COLOR, label="sender A (long RTT)")
     plt.plot(xs, [row["sender_b_goodput_gbps"] for row in rows],
-             marker="s", label="sender B (short RTT)")
+             marker="s", linewidth=2.2, color=MAIN_COLOR, label="sender B (short RTT)")
     plt.plot(xs, [row["aggregate_goodput_gbps"] for row in rows],
-             marker="^", label="aggregate", color="0.2")
-    plt.axhline(rows[0]["bottleneck_gbps"], color="0.45", linewidth=1.0,
+             marker="^", linewidth=2.0, label="aggregate", color="#2b2b2b")
+    plt.axhline(rows[0]["bottleneck_gbps"], color=NEUTRAL_COLOR, linewidth=1.0,
                 linestyle="--", label="receiver bottleneck")
     plt.xlabel("Sender A extra one-way delay (us)")
     plt.ylabel("Goodput (Gbps)")
-    plt.grid(True, alpha=0.3)
+    plt.xticks(xs, xs)
+    style_axes(plt.gca())
     plt.legend()
     plt.tight_layout()
     plt.savefig(out_dir / "sender_goodput_vs_rtt.png", dpi=180)
@@ -309,17 +322,18 @@ def write_plots(out_dir, rows):
     sender_a = [row["sender_a_goodput_gbps"] for row in rows]
     sender_b = [row["sender_b_goodput_gbps"] for row in rows]
     unused = [max(0.0, row["bottleneck_gbps"] - row["aggregate_goodput_gbps"]) for row in rows]
-    plt.bar(xs, sender_a, width=2.2, label="sender A goodput")
-    plt.bar(xs, sender_b, width=2.2, bottom=sender_a, label="sender B goodput")
+    plt.bar(xs, sender_a, width=2.2, color=ACCENT_COLOR, label="sender A goodput")
+    plt.bar(xs, sender_b, width=2.2, bottom=sender_a, color=MAIN_COLOR, label="sender B goodput")
     plt.bar(xs, unused, width=2.2,
             bottom=[a + b for a, b in zip(sender_a, sender_b)],
-            label="unused bottleneck capacity", color="0.82")
-    plt.axhline(bottleneck_gbps, color="0.35", linewidth=1.0,
+            label="unused bottleneck capacity", color="0.83")
+    plt.axhline(bottleneck_gbps, color=NEUTRAL_COLOR, linewidth=1.0,
                 linestyle="--", label="receiver bottleneck")
     plt.xlabel("Sender A extra one-way delay (us)")
     plt.ylabel("Goodput / capacity (Gbps)")
+    plt.xticks(xs, xs)
     plt.ylim(0, bottleneck_gbps * 1.12)
-    plt.grid(True, axis="y", alpha=0.3)
+    style_axes(plt.gca())
     plt.legend()
     plt.tight_layout()
     plt.savefig(out_dir / "goodput_stack_with_unused_capacity.png", dpi=180)
@@ -330,16 +344,17 @@ def write_plots(out_dir, rows):
     baseline_b = baseline["sender_b_goodput_gbps"] or 1.0
     baseline_aggregate = baseline["aggregate_goodput_gbps"] or 1.0
     plt.plot(xs, [row["sender_a_goodput_gbps"] / baseline_a * 100.0 for row in rows],
-             marker="o", label="sender A vs 0us")
+             marker="o", linewidth=2.2, color=ACCENT_COLOR, label="sender A vs 0us")
     plt.plot(xs, [row["sender_b_goodput_gbps"] / baseline_b * 100.0 for row in rows],
-             marker="s", label="sender B vs 0us")
+             marker="s", linewidth=2.2, color=MAIN_COLOR, label="sender B vs 0us")
     plt.plot(xs, [row["aggregate_goodput_gbps"] / baseline_aggregate * 100.0 for row in rows],
-             marker="^", color="0.2", label="aggregate vs 0us")
-    plt.axhline(100.0, color="#2f6f9f", linewidth=1.0,
+             marker="^", linewidth=2.0, color="#2b2b2b", label="aggregate vs 0us")
+    plt.axhline(100.0, color=MAIN_COLOR, linewidth=1.0,
                 linestyle=":", label="0us baseline")
     plt.xlabel("Sender A extra one-way delay (us)")
     plt.ylabel("Goodput relative to 0us baseline (%)")
-    plt.grid(True, alpha=0.3)
+    plt.xticks(xs, xs)
+    style_axes(plt.gca())
     plt.legend()
     plt.tight_layout()
     plt.savefig(out_dir / "normalized_goodput_vs_baseline.png", dpi=180)
@@ -347,12 +362,13 @@ def write_plots(out_dir, rows):
 
     plt.figure(figsize=(6.2, 4.0))
     plt.plot(xs, [row["sender_budget_ratio_a_to_b"] for row in rows],
-             marker="o", label="sender budget A/B")
-    plt.axhline(1.0, color="0.45", linewidth=1.0, linestyle="--", label="equal budget")
+             marker="o", linewidth=2.2, color=MAIN_COLOR, label="sender budget A/B")
+    plt.axhline(1.0, color=NEUTRAL_COLOR, linewidth=1.0, linestyle="--", label="equal budget")
     plt.xlabel("Sender A extra one-way delay (us)")
     plt.ylabel("Credit budget ratio")
+    plt.xticks(xs, xs)
     plt.ylim(0, max(1.2, max(row["sender_budget_ratio_a_to_b"] for row in rows) * 1.2))
-    plt.grid(True, alpha=0.3)
+    style_axes(plt.gca())
     plt.legend()
     plt.tight_layout()
     plt.savefig(out_dir / "sender_budget_ratio_vs_rtt.png", dpi=180)
@@ -360,16 +376,77 @@ def write_plots(out_dir, rows):
 
     plt.figure(figsize=(6.2, 4.0))
     plt.plot(xs, [row["receiver_queue_avg_pkts"] for row in rows],
-             marker="o", label="avg receiver queue")
+             marker="o", linewidth=2.2, color=MAIN_COLOR, label="avg receiver queue")
     plt.plot(xs, [row["receiver_queue_peak_pkts"] for row in rows],
-             marker="s", label="peak receiver queue")
+             marker="s", linewidth=2.2, color=ACCENT_COLOR, label="peak receiver queue")
     plt.xlabel("Sender A extra one-way delay (us)")
     plt.ylabel("Receiver-facing queue (packets)")
-    plt.grid(True, alpha=0.3)
+    plt.xticks(xs, xs)
+    style_axes(plt.gca())
     plt.legend()
     plt.tight_layout()
     plt.savefig(out_dir / "receiver_queue_vs_rtt.png", dpi=180)
     plt.close()
+
+    fig, axes = plt.subplots(1, 2, figsize=(10.8, 3.9))
+    ax = axes[0]
+    ax.bar(xs, utilization, width=2.2, color=MAIN_COLOR, alpha=0.9)
+    ax.plot(xs, [baseline_utilization_pct for _ in rows], color=MAIN_COLOR, linewidth=1.2, linestyle=":")
+    ax.plot(xs, [100.0 for _ in rows], color=NEUTRAL_COLOR, linewidth=1.0, linestyle="--")
+    for x, value, loss in zip(xs, utilization, loss_vs_baseline):
+        if loss > 0.5:
+            ax.text(x, value + 2.0, f"-{loss:.1f}pp", ha="center", fontsize=8)
+    ax.set_title("(a) Bottleneck utilization vs. homogeneous baseline")
+    ax.set_xlabel("Sender A extra one-way delay (us)")
+    ax.set_ylabel("Utilization (%)")
+    ax.set_xticks(xs, xs)
+    ax.set_ylim(0, 110)
+    style_axes(ax)
+
+    ax = axes[1]
+    ax.bar(xs, sender_a, width=2.2, color=ACCENT_COLOR, label="sender A")
+    ax.bar(xs, sender_b, width=2.2, bottom=sender_a, color=MAIN_COLOR, label="sender B")
+    ax.bar(xs, unused, width=2.2,
+           bottom=[a + b for a, b in zip(sender_a, sender_b)],
+           color="0.83", label="unused")
+    ax.axhline(bottleneck_gbps, color=NEUTRAL_COLOR, linewidth=1.0, linestyle="--")
+    ax.set_title("(b) Goodput decomposition of the 100Gbps bottleneck")
+    ax.set_xlabel("Sender A extra one-way delay (us)")
+    ax.set_ylabel("Goodput / capacity (Gbps)")
+    ax.set_xticks(xs, xs)
+    ax.set_ylim(0, bottleneck_gbps * 1.12)
+    style_axes(ax)
+    ax.legend(frameon=False)
+    fig.tight_layout()
+    fig.savefig(out_dir / "paper_main_result.png", dpi=220)
+    plt.close(fig)
+
+    fig, axes = plt.subplots(1, 2, figsize=(10.8, 3.9))
+    ax = axes[0]
+    ax.plot(xs, [row["sender_budget_ratio_a_to_b"] for row in rows],
+            marker="o", linewidth=2.2, color=MAIN_COLOR)
+    ax.axhline(1.0, color=NEUTRAL_COLOR, linewidth=1.0, linestyle="--")
+    ax.set_title("(a) Credit budget remains evenly split")
+    ax.set_xlabel("Sender A extra one-way delay (us)")
+    ax.set_ylabel("Budget ratio A/B")
+    ax.set_xticks(xs, xs)
+    ax.set_ylim(0.0, 1.2)
+    style_axes(ax)
+
+    ax = axes[1]
+    ax.plot(xs, [row["receiver_queue_avg_pkts"] for row in rows],
+            marker="o", linewidth=2.2, color=MAIN_COLOR, label="avg")
+    ax.plot(xs, [row["receiver_queue_peak_pkts"] for row in rows],
+            marker="s", linewidth=2.2, color=ACCENT_COLOR, label="peak")
+    ax.set_title("(b) Receiver-facing queue stays very small")
+    ax.set_xlabel("Sender A extra one-way delay (us)")
+    ax.set_ylabel("Queue occupancy (pkts)")
+    ax.set_xticks(xs, xs)
+    style_axes(ax)
+    ax.legend(frameon=False)
+    fig.tight_layout()
+    fig.savefig(out_dir / "paper_mechanism_result.png", dpi=220)
+    plt.close(fig)
 
 
 def main():

@@ -342,10 +342,10 @@ public:
                                      uint8_t eventType);
     
   /**
-   * \brief Return whether the memory optimizations are enabled
-   * \returns the m_memIsOptimized
+   * \brief Return whether outbound/inbound messages store only packet sizes.
+   * \return true when the memory-saving representation is enabled
    */
-  bool MemIsOptimized (void);
+  bool UsesOptimizedMemory (void);
     
   /**
    * \brief Create a HomaSocket and associate it with this Homa Protocol instance.
@@ -436,14 +436,14 @@ public:
                  Ptr<Ipv4Route> route=0);
   
   /**
-   * \brief Calculate the time it will take to drain the current TX queue
+   * \brief Calculate how long the local link-layer transmit queue remains busy.
    *
-   * Note that this function assumes the corresponding node only has Homa
-   * traffic on the tx direction.
+   * This estimate is maintained from Homa's own transmit activity, so it
+   * assumes the node is not simultaneously draining unrelated traffic.
    *
-   * \return The time it will take to drain the current TX queue
+   * \return Remaining drain time of the transmit queue
    */
-  Time GetTimeToDrainTxQueue (void);
+  Time GetTxQueueDrainDelay (void);
     
   // inherited from Ipv4L4Protocol
   /**
@@ -651,7 +651,7 @@ public:
    * \param pktOffset The index of the selected packet (determined inside this function)
    * \return Whether a packet was successfully selected for this message 
    */
-  bool GetNextPktOffset (uint16_t &pktOffset);
+  bool TryGetNextPktOffset (uint16_t &pktOffset);
 
   /**
    * \brief Whether this message must send a zero-payload credit request first.
@@ -747,21 +747,21 @@ private:
   std::vector<Ptr<Packet>> m_packets;   //!< Packet buffer for the message
   std::vector<uint32_t> m_pktSizes;     //!< Optimized packet buffer that keeps only the packet sizes instead of contents
   
-  std::priority_queue<uint16_t, std::vector<uint16_t>, std::greater<uint16_t> > m_pktTxQ; //!< The sorted queue of pkt offsets for tx
+  std::priority_queue<uint16_t, std::vector<uint16_t>, std::greater<uint16_t> > m_pktTxQ; //!< Min-heap of packet offsets still waiting to be sent or resent.
   
   uint32_t m_msgSizeBytes;   //!< Number of bytes this message occupies
   uint32_t m_maxPayloadSize; //!< Number of bytes that can be stored in packet excluding headers
-  uint32_t m_remainingBytes; //!< Remaining number of bytes that are not delivered yet
-  uint16_t m_maxGrantedIdx;  //!< Highest Grant Offset received so far (default: BDP)
+  uint32_t m_remainingBytes; //!< Sender-side estimate of bytes not yet fully delivered/ACKed for this message.
+  uint16_t m_maxGrantedIdx;  //!< Highest packet offset the receiver has currently authorized this sender to transmit.
   
-  uint8_t m_prio;            //!< The most recent priority of the message
-  bool m_prioSetByReceiver;  //!< Whether the receiver has specified a priority yet
-  bool m_waitForFirstGrant;  //!< Whether first data packet must wait for explicit GRANT
-  bool m_initialCreditRequestSent; //!< Whether the initial zero-payload request was sent
-  std::deque<Time> m_sirdCreditAvailableTimes; //!< Launch times for received scheduled credits
+  uint8_t m_prio;            //!< Most recent transmit priority requested by the receiver for this message.
+  bool m_prioSetByReceiver;  //!< Whether m_prio already reflects a receiver-issued GRANT/RESEND priority.
+  bool m_waitForFirstGrant;  //!< Whether real DATA is blocked until the first explicit GRANT arrives.
+  bool m_initialCreditRequestSent; //!< Whether the zero-payload DATA used to request the first GRANT was already sent.
+  std::deque<Time> m_sirdCreditAvailableTimes; //!< Per-credit release times after sender-side launch delay; one mature entry permits one DATA send.
   
-  EventId m_rtxEvent;        //!< The EventID for the retransmission timeout
-  bool m_isExpired;          //!< Whether this message has expired and to be cleared upon rtx timeouts
+  EventId m_rtxEvent;        //!< Sender-side timeout event used to detect lack of grant progress for this message.
+  bool m_isExpired;          //!< Whether the sender should garbage-collect this message after timeout with no newer grant progress.
 };
  
 /******************************************************************************/
@@ -797,21 +797,6 @@ public:
   int ScheduleNewMsg (Ptr<HomaOutboundMsg> outMsg);
   
   /**
-   * \brief Determines which message would be selected to send a packet from
-   * \param txMsgId The TX msg ID of the selected message (determined inside this function)
-   * \return Whether a message was successfully selected
-   */
-  bool GetNextMsgId (uint16_t &txMsgId);
-  
-  /**
-   * \brief Get the next "available to send" packet from the selected message
-   * \param txMsgId The ID of the selected message.
-   * \param p The selected packet from the corresponding message (determined inside this function)
-   * \return Whether a packet could successfully be selected
-   */
-  bool GetNextPktOfMsg (uint16_t txMsgId, Ptr<Packet> &p); 
-  
-  /**
    * \brief Send the next packet down to the IP layer and schedule next TX.
    */
   void TxDataPacket(void);
@@ -821,8 +806,8 @@ public:
    * \param ipv4Header The Ipv4 header of the received GRANT.
    * \param homaHeader The Homa header of the received GRANT.
    */
-  void CtrlPktRecvdForOutboundMsg (Ipv4Header const &ipv4Header, 
-                                   HomaHeader const &homaHeader);
+  void HandleControlPacketForOutboundMsg (Ipv4Header const &ipv4Header,
+                                          HomaHeader const &homaHeader);
   
   /**
    * \brief Delete the state for a msg and set the txMsgId as free again
@@ -837,6 +822,21 @@ public:
   uint32_t GetAccumulatedCreditPkts (void) const;
   
 private:
+  /**
+   * \brief Determines which message would be selected to send a packet from
+   * \param txMsgId The TX msg ID of the selected message (determined inside this function)
+   * \return Whether a message was successfully selected
+   */
+  bool SelectNextSendableMsgId (uint16_t &txMsgId);
+
+  /**
+   * \brief Select the next packet to transmit and identify its owning message.
+   * \param txMsgId The TX msg ID of the selected message (determined inside this function)
+   * \param p The selected packet from the corresponding message (determined inside this function)
+   * \return Whether a packet could successfully be selected
+   */
+  bool GetNextPacket (uint16_t &txMsgId, Ptr<Packet> &p);
+
   Ptr<HomaL4Protocol> m_homa; //!< the protocol instance itself that sends/receives messages
   
   EventId m_txEvent;          //!< The EventID for the next scheduled transmission
@@ -1030,21 +1030,21 @@ private:
   std::vector<Ptr<Packet>> m_packets;  //!< Packet buffer for the message
   std::vector<uint32_t> m_pktSizes;    //!< Optimized packet buffer that keeps only the packet sizes instead of contents
   
-  std::vector<bool> m_receivedPackets; //!< State to store which packets are delivered to the receiver
+  std::vector<bool> m_receivedPackets; //!< Per-packet receive bitmap; false entries are candidates for future RESEND generation.
    
   uint32_t m_remainingBytes; //!< Remaining number of bytes that are not received yet
   uint32_t m_msgSizeBytes;   //!< Number of bytes this message occupies
   uint16_t m_msgSizePkts;    //!< Number packets this message occupies
-  uint16_t m_maxGrantableIdx;//!< Highest Grant Offset determined so far (default: m_rttPackets)
-  uint16_t m_maxGrantedIdx;  //!< Highest Grant Offset sent so far
-  uint8_t m_prio;            //!< The most recent granted priority set for this message
-  bool m_hasGrantedData;     //!< Whether at least one real DATA packet has been granted
-  bool m_creditDrivenGrantWindow; //!< Whether SIRD credit bucket is the only grant-window source
-  bool m_currentlyScheduled; //!< Whether this message is prioritized enough to be actively granted
+  uint16_t m_maxGrantableIdx;//!< Highest packet offset the receiver is currently willing to expose to GRANT generation.
+  uint16_t m_maxGrantedIdx;  //!< Highest packet offset already advertised to the sender in a GRANT packet.
+  uint8_t m_prio;            //!< Most recent priority carried in GRANT/ACK/RESEND generated for this message.
+  bool m_hasGrantedData;     //!< Whether at least one non-ACK GRANT has been sent, i.e. sender may already launch scheduled DATA.
+  bool m_creditDrivenGrantWindow; //!< Whether the grantable boundary advances only through SIRD credit issuance, not just DATA arrivals.
+  bool m_currentlyScheduled; //!< Whether the scheduler selected this message in the current round as actively grant-served.
   
-  EventId m_rtxEvent;        //!< The EventID for the retransmission timeout
-  uint16_t m_lastRtxGrntIdx; //!< The m_maxGrantableIdx value as of last time rtx timer expired
-  uint16_t m_numRtxWithoutProgress;   //!< The number of rtx timeouts without receiving any new packet
+  EventId m_rtxEvent;        //!< Receiver-side timeout event that triggers RESEND generation when granted data stops arriving.
+  uint16_t m_lastRtxGrntIdx; //!< Snapshot of m_maxGrantableIdx at the previous timeout, used to detect whether grant progress advanced.
+  uint16_t m_numRtxWithoutProgress;   //!< Consecutive timeout count with no new receive-side progress, used to stop retrying stalled flows.
 };
     
 /******************************************************************************/
@@ -1096,22 +1096,22 @@ public:
                           Ptr<Ipv4Interface> interface);
   
   /**
-   * \brief Try to find the message of the provided headers among the pending inbound messages.
+   * \brief Try to find the active inbound message matching the received packet.
    * \param ipv4Header IPv4 header of the received packet.
    * \param homaHeader The Homa header of the received packet.
-   * \param msgIdx The index of the message if it is already an active (not busy) one. (determined inside this function)
-   * \return Whether the corresponding inbound message was found among the pending messages.
+   * \param msgIdx The index of the matching message in the active list.
+   * \return Whether the corresponding inbound message was found.
    */
-  bool GetInboundMsg(Ipv4Header const &ipv4Header, 
-                     HomaHeader const &homaHeader,
-                     int &msgIdx);
+  bool FindInboundMsg (Ipv4Header const &ipv4Header,
+                       HomaHeader const &homaHeader,
+                       int &msgIdx);
   
   /**
-   * \brief Insert or reorder a message within the list of pending inbound messages.
-   * \param inboundMsg The message that is asked to be scheduled
-   * \param msgIdx The index of the message if it is already a pending one, -1 otherwise.
+   * \brief Insert or reorder a message within the active inbound list.
+   * \param inboundMsg The message to place in scheduling order
+   * \param msgIdx The old index of the message if it is already active, -1 otherwise
    */
-  void ScheduleMsgAtIdx(Ptr<HomaInboundMsg> inboundMsg, int msgIdx);
+  void RescheduleInboundMsg (Ptr<HomaInboundMsg> inboundMsg, int msgIdx);
   
   /**
    * \brief Reassemble the packets of the incoming message and forward up to the sockets.
@@ -1121,16 +1121,16 @@ public:
   void ForwardUp(Ptr<HomaInboundMsg> inboundMsg, int msgIdx);
   
   /**
-   * \brief Cancel timer of the given message and remove from the pending messages list if needed
-   * \param inboundMsg The incoming message that is to be removed.
-   * \param msgIdx The index of the message if it is a pending one, -1 otherwise.
+   * \brief Cancel timer state and remove an inbound message from the active list.
+   * \param inboundMsg The incoming message that is to be removed
+   * \param msgIdx The index of the message if it is active, -1 otherwise
    */
-  void ClearStateForMsg(Ptr<HomaInboundMsg> inboundMsg, int msgIdx);
+  void RemoveInboundMsg (Ptr<HomaInboundMsg> inboundMsg, int msgIdx);
   
-    /**
-   * \brief Loop through the list of active messages and send Grants to the grantable ones
+  /**
+   * \brief Walk active inbound messages and issue any GRANTs that are currently allowed.
    */
-  bool SendAppropriateGrants(void);
+  bool IssuePendingGrants (void);
   
   /**
    * \brief Gets appropriate RESEND packets for the inbound message and sends them down.
@@ -1139,21 +1139,39 @@ public:
    */
   void ExpireRtxTimeout(Ptr<HomaInboundMsg> inboundMsg, uint16_t maxRsndPktOffset);
 
+  /**
+   * \brief Ensure the next tick-based credit issuance event is scheduled.
+   * \param immediate true to schedule at current simulation time
+   */
   void EnsureCreditTickScheduled (bool immediate);
+
+  /**
+   * \brief Periodic driver for SIRD credit issuance.
+   */
   void CreditTick (void);
+
+  /**
+   * \brief Check whether any sender can receive more credits right now.
+   * \return true when at least one grant opportunity exists
+   */
   bool HasGrantOpportunity (void) const;
+
+  /**
+   * \brief Get spacing between tick-driven grant opportunities.
+   * \return interval between consecutive credit ticks
+   */
   Time GetCreditTickInterval (void) const;
   
 private:
-  Ptr<HomaL4Protocol> m_homa; //!< the protocol instance itself that sends/receives messages
+  Ptr<HomaL4Protocol> m_homa; //!< The protocol instance that owns this receive scheduler.
   
-  std::vector<Ptr<HomaInboundMsg>> m_inboundMsgs; //!< Sorted vector of inbound messages that are to be scheduled
-  std::unordered_set<uint32_t>  m_busySenders; //!< Set of senders from whom the last received pkt type is BUSY
-  std::unordered_map<uint32_t, double> m_sirdSenderBudgetNetPkts; //表示每个 sender 在“网络核心拥塞”这条控制环下允许拥有的 credit 上限，单位是 packet。这个值主要根据 ECN/CE 做 AI/MD 调整。
-  std::unordered_map<uint32_t, double> m_sirdSenderBudgetHostPkts; //表示每个 sender 在“发送端拥塞”这条控制环下允许拥有的 credit 上限，初始化为 1bdp
+  std::vector<Ptr<HomaInboundMsg>> m_inboundMsgs; //!< Active inbound messages ordered for grant scheduling.
+  std::unordered_set<uint32_t>  m_busySenders; //!< Senders whose most recent control state asks us to back off.
+  std::unordered_map<uint32_t, double> m_sirdSenderBudgetNetPkts; //!< Per-sender credit cap from the ECN/network loop, in packets.
+  std::unordered_map<uint32_t, double> m_sirdSenderBudgetHostPkts; //!< Per-sender credit cap from sender-host feedback, in packets.
   std::unordered_map<uint32_t, double> m_sirdSenderNetAlpha; //!< DCTCP-style CE fraction EWMA per sender
   std::unordered_map<uint32_t, double> m_sirdSenderHostAlpha; //!< DCTCP-style CSN fraction EWMA per sender
-  std::unordered_map<uint32_t, uint32_t> m_sirdSenderCreditsInUsePkts; //当前已经借出去多少 credit
+  std::unordered_map<uint32_t, uint32_t> m_sirdSenderCreditsInUsePkts; //!< Outstanding credits currently consumed by each sender.
   std::unordered_map<uint32_t, bool> m_sirdSenderCsnState; //!< Last seen csn feedback per sender
   std::unordered_map<uint32_t, bool> m_sirdSenderCeState; //!< Last seen CE mark per sender
   std::unordered_map<uint32_t, uint64_t> m_sirdSenderDataPktsObserved; //!< Number of DATA packets observed per sender
@@ -1162,7 +1180,7 @@ private:
   std::unordered_map<uint32_t, uint64_t> m_sirdSenderEpochDataPkts; //!< Number of DATA packets observed in current sender epoch
   std::unordered_map<uint32_t, uint64_t> m_sirdSenderEpochCeMarks; //!< Number of CE-marked DATA packets in current sender epoch
   std::unordered_map<uint32_t, uint64_t> m_sirdSenderEpochCsnMarks; //!< Number of CSN-marked DATA packets in current sender epoch
-  uint32_t m_sirdGlobalCreditsInUsePkts; //当前已经借出去多少 credit 全局B
+  uint32_t m_sirdGlobalCreditsInUsePkts; //!< Outstanding credits currently consumed across all senders.
   double m_sirdCeRatioEwma; //!< EWMA of ECN CE ratio over received data packets
   uint64_t m_sirdDataPktsObserved; //!< Number of data packets observed for ECN ratio estimation
   uint64_t m_sirdCeMarksObserved; //!< Number of CE-marked packets observed
