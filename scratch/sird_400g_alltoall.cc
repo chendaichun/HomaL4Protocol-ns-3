@@ -3,8 +3,8 @@
  * 400G single-switch all-to-all scenario using the Homa/SIRD protocol path.
  *
  * This scenario intentionally does not configure PFC/QCN switch controls.  It
- * uses Homa sockets, optionally enables SIRD, and records receiver-side DATA
- * payload throughput so the output can be plotted as a throughput-vs-time curve.
+ * uses Homa sockets, optionally enables SIRD, and records both receiver-side
+ * aggregate throughput and switch-side per-flow throughput.
  */
 
 #include <array>
@@ -25,6 +25,7 @@
 #include "ns3/ipv4-global-routing-helper.h"
 #include "ns3/network-module.h"
 #include "ns3/point-to-point-module.h"
+#include "ns3/ppp-header.h"
 #include "ns3/traffic-control-module.h"
 
 using namespace ns3;
@@ -47,8 +48,10 @@ struct ExperimentStats
   uint32_t msgFinishCount = 0;
   uint64_t msgFinishBytes = 0;
   uint64_t dataRxBytes = 0;
+  uint64_t switchTxPayloadBytes = 0;
   std::map<std::pair<uint32_t, uint32_t>, uint64_t> finishedBytesByFlow;
   std::map<std::pair<uint32_t, uint32_t>, uint64_t> dataBytesByFlow;
+  std::map<std::pair<uint32_t, uint32_t>, uint64_t> switchBytesByFlow;
   std::map<uint32_t, uint64_t> dataRxBytesByReceiver;
 };
 
@@ -57,6 +60,8 @@ static std::map<uint32_t, uint32_t> g_receiverIndexByIpv4;
 static std::map<uint32_t, uint32_t> g_hostIndexByIpv4;
 static std::map<std::string, uint64_t> g_throughputBytes;
 static std::map<std::string, uint64_t> g_throughputPrevBytes;
+static std::map<std::pair<uint32_t, uint32_t>, uint64_t> g_switchFlowBytes;
+static std::map<std::pair<uint32_t, uint32_t>, uint64_t> g_switchFlowPrevBytes;
 static uint32_t g_receiverCount = 4;
 
 uint32_t
@@ -77,6 +82,14 @@ GbpsString (double value)
   std::ostringstream out;
   out << value << "Gbps";
   return out.str ();
+}
+
+std::string
+FlowSeriesName (uint32_t zeroBasedSrc, uint32_t zeroBasedDst)
+{
+  std::ostringstream label;
+  label << OriginalHostId (zeroBasedSrc) << "->" << OriginalHostId (zeroBasedDst);
+  return label.str ();
 }
 
 void
@@ -182,6 +195,47 @@ TraceDataArrival (Ptr<const Packet> packet,
 }
 
 void
+TraceSwitchPhyTxBegin (Ptr<const Packet> packet)
+{
+  Ptr<Packet> copy = packet->Copy ();
+
+  PppHeader pppHeader;
+  copy->RemoveHeader (pppHeader);
+  if (pppHeader.GetProtocol () != 0x0021)
+    {
+      return;
+    }
+
+  Ipv4Header ipv4Header;
+  copy->RemoveHeader (ipv4Header);
+  if (ipv4Header.GetProtocol () != HomaHeader::PROT_NUMBER)
+    {
+      return;
+    }
+
+  HomaHeader homaHeader;
+  copy->RemoveHeader (homaHeader);
+  if ((homaHeader.GetFlags () & HomaHeader::Flags_t::DATA) == 0 ||
+      homaHeader.GetPayloadSize () == 0)
+    {
+      return;
+    }
+
+  auto srcIt = g_hostIndexByIpv4.find (ipv4Header.GetSource ().Get ());
+  auto dstIt = g_hostIndexByIpv4.find (ipv4Header.GetDestination ().Get ());
+  if (srcIt == g_hostIndexByIpv4.end () || dstIt == g_hostIndexByIpv4.end ())
+    {
+      return;
+    }
+
+  const auto flow = std::make_pair (srcIt->second, dstIt->second);
+  uint64_t bytes = homaHeader.GetPayloadSize ();
+  g_stats.switchTxPayloadBytes += bytes;
+  g_stats.switchBytesByFlow[flow] += bytes;
+  g_switchFlowBytes[flow] += bytes;
+}
+
+void
 SampleThroughput (Ptr<OutputStreamWrapper> stream, Time interval, Time stopTime)
 {
   std::vector<std::string> labels;
@@ -226,6 +280,42 @@ SampleThroughput (Ptr<OutputStreamWrapper> stream, Time interval, Time stopTime)
 }
 
 void
+SampleSwitchFlowThroughput (Ptr<OutputStreamWrapper> stream,
+                            Time interval,
+                            Time stopTime,
+                            std::vector<FlowConfig> flows)
+{
+  for (const auto& flowConfig : flows)
+    {
+      const auto flow = std::make_pair (flowConfig.srcHost, flowConfig.dstHost);
+      uint64_t totalBytes = g_switchFlowBytes[flow];
+      uint64_t prevBytes = g_switchFlowPrevBytes[flow];
+      uint64_t deltaBytes = totalBytes - prevBytes;
+      g_switchFlowPrevBytes[flow] = totalBytes;
+
+      double instGbps = deltaBytes * 8.0 / interval.GetSeconds () / 1e9;
+      *stream->GetStream () << Simulator::Now ().GetNanoSeconds ()
+                            << " series=" << FlowSeriesName (flowConfig.srcHost,
+                                                             flowConfig.dstHost)
+                            << " srcHost=" << OriginalHostId (flowConfig.srcHost)
+                            << " dstHost=" << OriginalHostId (flowConfig.dstHost)
+                            << " instGbps=" << instGbps
+                            << " totalBytes=" << totalBytes
+                            << std::endl;
+    }
+
+  if (Simulator::Now () + interval <= stopTime)
+    {
+      Simulator::Schedule (interval,
+                           &SampleSwitchFlowThroughput,
+                           stream,
+                           interval,
+                           stopTime,
+                           flows);
+    }
+}
+
+void
 WriteSummary (const std::string& path,
               const std::vector<FlowConfig>& flows,
               double linkRateGbps,
@@ -247,6 +337,7 @@ WriteSummary (const std::string& path,
 
   double dataGoodputGbps = g_stats.dataRxBytes * 8.0 / stopTime / 1e9;
   double finishedGoodputGbps = g_stats.msgFinishBytes * 8.0 / stopTime / 1e9;
+  double switchPayloadGoodputGbps = g_stats.switchTxPayloadBytes * 8.0 / stopTime / 1e9;
 
   out << "linkRateGbps,linkDelay,deviceMtuBytes,stopTimeSec,enableSird,useEcn,"
          "bdpPkts,sirdCreditBudgetPkts,sirdUnschThresholdPkts\n";
@@ -255,14 +346,19 @@ WriteSummary (const std::string& path,
       << "," << bdpPkts << "," << sirdCreditBudgetPkts << ","
       << sirdUnschThresholdPkts << "\n\n";
 
-  out << "targetBytes,dataRxBytes,msgFinishBytes,msgBeginCount,msgFinishCount,"
-         "dataCompletionRatio,msgCompletionRatio,dataGoodputGbps,finishedGoodputGbps\n";
-  out << targetBytes << "," << g_stats.dataRxBytes << "," << g_stats.msgFinishBytes
+  out << "targetBytes,dataRxBytes,switchTxPayloadBytes,msgFinishBytes,msgBeginCount,msgFinishCount,"
+         "dataCompletionRatio,switchCompletionRatio,msgCompletionRatio,dataGoodputGbps,"
+         "switchPayloadGoodputGbps,finishedGoodputGbps\n";
+  out << targetBytes << "," << g_stats.dataRxBytes << "," << g_stats.switchTxPayloadBytes
+      << "," << g_stats.msgFinishBytes
       << "," << g_stats.msgBeginCount << "," << g_stats.msgFinishCount << ","
       << (targetBytes ? static_cast<double> (g_stats.dataRxBytes) / targetBytes : 0.0)
       << ","
+      << (targetBytes ? static_cast<double> (g_stats.switchTxPayloadBytes) / targetBytes : 0.0)
+      << ","
       << (targetBytes ? static_cast<double> (g_stats.msgFinishBytes) / targetBytes : 0.0)
-      << "," << dataGoodputGbps << "," << finishedGoodputGbps << "\n\n";
+      << "," << dataGoodputGbps << "," << switchPayloadGoodputGbps << ","
+      << finishedGoodputGbps << "\n\n";
 
   out << "srcHost,dstHost,targetBytes,finishedBytes,completionRatio\n";
   for (const auto& flow : flows)
@@ -285,6 +381,18 @@ WriteSummary (const std::string& path,
       out << OriginalHostId (flow.srcHost) << ","
           << OriginalHostId (flow.dstHost) << ","
           << dataBytes << ","
+          << ratio << "\n";
+    }
+
+  out << "\n";
+  out << "srcHost,dstHost,switchTxPayloadBytes,switchTxRatio\n";
+  for (const auto& flow : flows)
+    {
+      uint64_t switchBytes = g_stats.switchBytesByFlow[std::make_pair (flow.srcHost, flow.dstHost)];
+      double ratio = flow.bytes ? static_cast<double> (switchBytes) / flow.bytes : 0.0;
+      out << OriginalHostId (flow.srcHost) << ","
+          << OriginalHostId (flow.dstHost) << ","
+          << switchBytes << ","
           << ratio << "\n";
     }
 }
@@ -410,6 +518,19 @@ main (int argc, char* argv[])
     }
   Ipv4GlobalRoutingHelper::PopulateRoutingTables ();
 
+  std::vector<FlowConfig> flows;
+  for (uint32_t src = 0; src < 4; ++src)
+    {
+      for (uint32_t dst = 0; dst < 4; ++dst)
+        {
+          if (src == dst)
+            {
+              continue;
+            }
+          flows.push_back ({src, dst, msgSizeBytes, startSec});
+        }
+    }
+
   std::system (("mkdir -p " + outputDir).c_str ());
   AsciiTraceHelper ascii;
   std::ostringstream prefix;
@@ -422,6 +543,11 @@ main (int argc, char* argv[])
                                  MakeBoundCallback (&TraceMsgFinish, msgStream));
   Config::ConnectWithoutContext ("/NodeList/*/$ns3::HomaL4Protocol/DataPktArrival",
                                  MakeCallback (&TraceDataArrival));
+  for (uint32_t i = 0; i < links.size (); ++i)
+    {
+      links[i].Get (0)->TraceConnectWithoutContext ("PhyTxBegin",
+                                                    MakeCallback (&TraceSwitchPhyTxBegin));
+    }
 
   Ptr<OutputStreamWrapper> throughputStream =
       ascii.CreateFileStream (prefix.str () + ".throughput.tr");
@@ -430,6 +556,14 @@ main (int argc, char* argv[])
                        throughputStream,
                        MicroSeconds (sampleIntervalUs),
                        Seconds (stopTimeSec));
+  Ptr<OutputStreamWrapper> switchFlowThroughputStream =
+      ascii.CreateFileStream (prefix.str () + ".switch-flow-throughput.tr");
+  Simulator::Schedule (Seconds (startSec) + MicroSeconds (sampleIntervalUs),
+                       &SampleSwitchFlowThroughput,
+                       switchFlowThroughputStream,
+                       MicroSeconds (sampleIntervalUs),
+                       Seconds (stopTimeSec),
+                       flows);
 
   std::array<Ptr<Socket>, 4> receiverSockets;
   std::array<InetSocketAddress, 4> receiverAddrs = {
@@ -454,22 +588,13 @@ main (int argc, char* argv[])
       senderSockets[i]->Bind (InetSocketAddress (hostIps[i], static_cast<uint16_t> (20000 + i)));
     }
 
-  std::vector<FlowConfig> flows;
-  for (uint32_t src = 0; src < 4; ++src)
+  for (const auto& flow : flows)
     {
-      for (uint32_t dst = 0; dst < 4; ++dst)
-        {
-          if (src == dst)
-            {
-              continue;
-            }
-          flows.push_back ({src, dst, msgSizeBytes, startSec});
-          Simulator::Schedule (Seconds (startSec),
-                               &SendOneShot,
-                               senderSockets[src],
-                               receiverAddrs[dst],
-                               msgSizeBytes);
-        }
+      Simulator::Schedule (Seconds (flow.startSec),
+                           &SendOneShot,
+                           senderSockets[flow.srcHost],
+                           receiverAddrs[flow.dstHost],
+                           static_cast<uint32_t> (flow.bytes));
     }
 
   Simulator::Stop (Seconds (stopTimeSec));
