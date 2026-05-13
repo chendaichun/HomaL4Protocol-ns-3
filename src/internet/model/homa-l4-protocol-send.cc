@@ -44,7 +44,7 @@
 
 namespace ns3 {
 
-NS_LOG_COMPONENT_DEFINE ("HomaL4Protocol");
+NS_LOG_COMPONENT_DEFINE ("HomaL4ProtocolSend");
 
 void
 // 应用层发送入口：构造 OutboundMsg 并交给发送调度器分配 txMsgId 与后续发送时机。

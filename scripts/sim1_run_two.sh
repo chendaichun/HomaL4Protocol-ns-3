@@ -24,6 +24,11 @@ ANALYZE_DURATION_SEC="${ANALYZE_DURATION_SEC:-$TRACE_DURATION_SEC}"
 SETTLE_TAIL_SEC="${SETTLE_TAIL_SEC:-0.2}"
 MAX_SETTLE_RETRIES="${MAX_SETTLE_RETRIES:-3}"
 SETTLE_TAIL_MULTIPLIER="${SETTLE_TAIL_MULTIPLIER:-2}"
+N_HOSTS="${N_HOSTS:-144}"
+HOSTS_PER_TOR="${HOSTS_PER_TOR:-16}"
+N_TORS="${N_TORS:-9}"
+N_SPINES="${N_SPINES:-4}"
+INCAST_SENDERS="${INCAST_SENDERS:-30}"
 QUEUE_SAMPLE_US="${QUEUE_SAMPLE_US:-100}"
 GOODPUT_SAMPLE_US="${GOODPUT_SAMPLE_US:-100}"
 TRACE_MSG="${TRACE_MSG:-1}"
@@ -75,12 +80,17 @@ run_case() {
       "--traceStartSec=$TRACE_START_SEC"
       "--traceDurationSec=$TRACE_DURATION_SEC"
       "--settleTailSec=$settle_tail_sec"
+      "--nHosts=$N_HOSTS"
+      "--hostsPerTor=$HOSTS_PER_TOR"
+      "--nTors=$N_TORS"
+      "--nSpines=$N_SPINES"
       "--traceMsg=$TRACE_MSG"
       "--traceTorQueue=$TRACE_TOR_QUEUE"
       "--traceTorQueueSeries=$TRACE_TOR_QUEUE_SERIES"
       "--traceGoodput=$TRACE_GOODPUT"
       "--queueSampleUs=$QUEUE_SAMPLE_US"
       "--goodputSampleUs=$GOODPUT_SAMPLE_US"
+      "--incastSenders=$INCAST_SENDERS"
       "--deviceQueueMaxSize=$DEVICE_QUEUE_MAX_SIZE"
       "--qdiscMaxSize=$QDISC_MAX_SIZE"
       "--torQueueIncludeDevice=$TOR_QUEUE_INCLUDE_DEVICE"
@@ -123,16 +133,27 @@ run_case() {
 pids=()
 read -r -a traffic_configs <<< "$TRAFFIC_CONFIGS"
 read -r -a selected_workload_tags <<< "$WORKLOAD_TAGS"
-declare -A workload_file_map=(
-  [google_rpc]=inputs/W3_Google_AllRPC_cdf.csv
-  [facebook_hadoop]=inputs/W4_Facebook_Hadoop_cdf.csv
-  [web_search]=inputs/W5_DCTCP_scaled1442_bytes_cdf.csv
-)
+
+workload_file_for_tag() {
+  case "$1" in
+    google_rpc)
+      echo "inputs/W3_Google_AllRPC_cdf.csv"
+      ;;
+    facebook_hadoop)
+      echo "inputs/W4_Facebook_Hadoop_cdf.csv"
+      ;;
+    web_search)
+      echo "inputs/W5_DCTCP_scaled1442_bytes_cdf.csv"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
 
 for traffic_config in "${traffic_configs[@]}"; do
   for workload_tag in "${selected_workload_tags[@]}"; do
-    workload_file="${workload_file_map[$workload_tag]:-}"
-    if [[ -z "$workload_file" ]]; then
+    if ! workload_file="$(workload_file_for_tag "$workload_tag")"; then
       echo "unknown workload tag: $workload_tag" >&2
       exit 1
     fi

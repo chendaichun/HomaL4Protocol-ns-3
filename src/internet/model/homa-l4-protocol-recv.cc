@@ -44,7 +44,7 @@
 
 namespace ns3 {
 
-NS_LOG_COMPONENT_DEFINE ("HomaL4Protocol");
+NS_LOG_COMPONENT_DEFINE ("HomaL4ProtocolRecv");
 
 /*
  * This method is called by the HomaRecvScheduler everytime a message is ready to

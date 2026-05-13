@@ -90,7 +90,16 @@ struct QueueSampleTarget
 static std::vector<QueueSampleTarget> g_torEgressQueueTargets;
 static Time g_queueActiveStart = Seconds (0);
 static Time g_queueActiveEnd = Seconds (0);
+static Time g_statsActiveStart = Seconds (0);
+static Time g_statsActiveEnd = Seconds (0);
 static bool g_torQueueIncludeDevice = false;
+
+static bool
+IsStatsWindowActive ()
+{
+  Time now = Simulator::Now ();
+  return now >= g_statsActiveStart && now <= g_statsActiveEnd;
+}
 
 static MessageRole
 ClassifyMessageRole (uint16_t sport, uint16_t dport)
@@ -255,6 +264,10 @@ TraceMsgBegin (Ptr<OutputStreamWrapper> stream,
                uint16_t dport,
                int txMsgId)
 {
+  if (!IsStatsWindowActive ())
+    {
+      return;
+    }
   MessageRole role = ClassifyMessageRole (sport, dport);
   *stream->GetStream () << "+ " << Simulator::Now ().GetNanoSeconds ()
                         << " " << msg->GetSize ()
@@ -275,22 +288,28 @@ TraceMsgFinish (Ptr<OutputStreamWrapper> stream,
                 int txMsgId)
 {
   MessageRole role = ClassifyMessageRole (sport, dport);
-  g_goodputCounters.totalBytes += msg->GetSize ();
-  if (role == MessageRole::kRequest)
+  if (IsStatsWindowActive ())
     {
-      g_goodputCounters.requestBytes += msg->GetSize ();
+      g_goodputCounters.totalBytes += msg->GetSize ();
+      if (role == MessageRole::kRequest)
+        {
+          g_goodputCounters.requestBytes += msg->GetSize ();
+        }
+      else if (role == MessageRole::kResponse)
+        {
+          g_goodputCounters.responseBytes += msg->GetSize ();
+        }
+      if (stream)
+        {
+          *stream->GetStream () << "- " << Simulator::Now ().GetNanoSeconds ()
+                                << " " << msg->GetSize ()
+                                << " " << saddr << ":" << sport
+                                << " " << daddr << ":" << dport
+                                << " " << txMsgId
+                                << " kind=" << MessageRoleToString (role)
+                                << std::endl;
+        }
     }
-  else if (role == MessageRole::kResponse)
-    {
-      g_goodputCounters.responseBytes += msg->GetSize ();
-    }
-  *stream->GetStream () << "- " << Simulator::Now ().GetNanoSeconds ()
-                        << " " << msg->GetSize ()
-                        << " " << saddr << ":" << sport
-                        << " " << daddr << ":" << dport
-                        << " " << txMsgId
-                        << " kind=" << MessageRoleToString (role)
-                        << std::endl;
 }
 
 static void
@@ -329,12 +348,15 @@ SampleGoodput (Ptr<OutputStreamWrapper> stream,
                         << " numHosts=" << numHosts
                         << std::endl;
 
-  Simulator::Schedule (sampleInterval,
-                       &SampleGoodput,
-                       stream,
-                       sampleInterval,
-                       checkpoint,
-                       numHosts);
+  if (Simulator::Now () + sampleInterval <= g_statsActiveEnd)
+    {
+      Simulator::Schedule (sampleInterval,
+                           &SampleGoodput,
+                           stream,
+                           sampleInterval,
+                           checkpoint,
+                           numHosts);
+    }
 }
 
 static void
@@ -626,6 +648,10 @@ main (int argc, char* argv[])
   cmd.AddValue ("traceStartSec", "Explicit stats window start time; negative falls back to startSec", traceStartSec);
   cmd.AddValue ("traceDurationSec", "Explicit stats window duration; negative falls back to durationSec", traceDurationSec);
   cmd.AddValue ("settleTailSec", "Drain time after traffic stop", settleTailSec);
+  cmd.AddValue ("nHosts", "Number of hosts in the leaf-spine topology", nHosts);
+  cmd.AddValue ("hostsPerTor", "Number of hosts attached to each ToR", hostsPerTor);
+  cmd.AddValue ("nTors", "Number of ToR switches", nTors);
+  cmd.AddValue ("nSpines", "Number of spine switches", nSpines);
   cmd.AddValue ("torSpineRateGbps", "Override ToR-Spine rate in Gbps; <=0 uses trafficConfig default", torSpineRateGbps);
   cmd.AddValue ("traceMsg", "Trace message begin/finish", traceMsg);
   cmd.AddValue ("traceTorQueue", "Sample ToR egress queues over time", traceTorQueue);
@@ -897,17 +923,23 @@ main (int argc, char* argv[])
 
   Ipv4GlobalRoutingHelper::PopulateRoutingTables ();
 
+  g_statsActiveStart = Seconds (effectiveTraceStartSec);
+  g_statsActiveEnd = Seconds (effectiveTraceStartSec + effectiveTraceDurationSec);
+
   AsciiTraceHelper ascii;
   std::string mkdirCmd = "mkdir -p " + outputDir;
   std::system (mkdirCmd.c_str ());
   std::ostringstream prefix;
   prefix << outputDir << "/sim1_" << simTag;
 
-  if (traceMsg)
+  if (traceMsg || traceGoodput)
     {
-      Ptr<OutputStreamWrapper> msgStream = ascii.CreateFileStream (prefix.str () + ".msg.tr");
-      Config::ConnectWithoutContext ("/NodeList/*/$ns3::HomaL4Protocol/MsgBegin",
-                                     MakeBoundCallback (&TraceMsgBegin, msgStream));
+      Ptr<OutputStreamWrapper> msgStream = traceMsg ? ascii.CreateFileStream (prefix.str () + ".msg.tr") : nullptr;
+      if (traceMsg)
+        {
+          Config::ConnectWithoutContext ("/NodeList/*/$ns3::HomaL4Protocol/MsgBegin",
+                                         MakeBoundCallback (&TraceMsgBegin, msgStream));
+        }
       Config::ConnectWithoutContext ("/NodeList/*/$ns3::HomaL4Protocol/MsgFinish",
                                      MakeBoundCallback (&TraceMsgFinish, msgStream));
     }
@@ -916,7 +948,7 @@ main (int argc, char* argv[])
     {
       Ptr<OutputStreamWrapper> goodputStream = ascii.CreateFileStream (prefix.str () + ".goodput.tr");
       GoodputCheckpoint* checkpoint = new GoodputCheckpoint ();
-      Simulator::Schedule (MicroSeconds (goodputSampleUs),
+      Simulator::Schedule (Seconds (effectiveTraceStartSec) + MicroSeconds (goodputSampleUs),
                            &SampleGoodput,
                            goodputStream,
                            MicroSeconds (goodputSampleUs),
@@ -1032,7 +1064,8 @@ main (int argc, char* argv[])
                                queueStream,
                                MicroSeconds (queueSampleUs));
         }
-      Simulator::Schedule (Seconds (simulationStopSec),
+      Time queueSummaryTime = std::max (Seconds (0), Seconds (simulationStopSec) - NanoSeconds (1));
+      Simulator::Schedule (queueSummaryTime,
                            &WriteTorQueuePeakSummary,
                            queueStream);
     }
