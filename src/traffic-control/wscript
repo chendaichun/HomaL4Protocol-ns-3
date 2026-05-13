@@ -16,6 +16,10 @@ def build(bld):
       'model/pfifo-homa-queue-disc.cc',
       'model/fifo-queue-disc.cc',
       'model/sird-queue-disc.cc',
+      'model/switch-congestion-controller.cc',
+      'model/switch-flow-id-tag.cc',
+      'model/switch-shared-buffer-pool.cc',
+      'model/switch-shared-buffer-queue-disc.cc',
       'model/red-queue-disc.cc',
       'model/codel-queue-disc.cc',
       'model/fq-codel-queue-disc.cc',
@@ -39,7 +43,8 @@ def build(bld):
       'test/queue-disc-traces-test-suite.cc',
       'test/tbf-queue-disc-test-suite.cc',
       'test/tc-flow-control-test-suite.cc',
-      'test/cobalt-queue-disc-test-suite.cc'
+      'test/cobalt-queue-disc-test-suite.cc',
+      'test/switch-shared-buffer-queue-disc-test-suite.cc'
         ]
 
     # Tests encapsulating example programs should be listed here
@@ -58,6 +63,10 @@ def build(bld):
       'model/pfifo-homa-queue-disc.h',
       'model/fifo-queue-disc.h',
       'model/sird-queue-disc.h',
+      'model/switch-congestion-controller.h',
+      'model/switch-flow-id-tag.h',
+      'model/switch-shared-buffer-pool.h',
+      'model/switch-shared-buffer-queue-disc.h',
       'model/red-queue-disc.h',
       'model/codel-queue-disc.h',
       'model/fq-codel-queue-disc.h',

@@ -6,6 +6,7 @@ def build(bld):
         'model/bulk-send-application.cc',
         'model/onoff-application.cc',
         'model/msg-generator-app.cc',
+        'model/rate-controlled-flow-app.cc',
         'model/rpc-workload-app.cc',
         'model/packet-sink.cc',
         'model/udp-client.cc',
@@ -34,6 +35,7 @@ def build(bld):
     applications_test.source = [
         'test/three-gpp-http-client-server-test.cc', 
         'test/bulk-send-application-test-suite.cc',
+        'test/rate-controlled-flow-app-test-suite.cc',
         'test/udp-client-server-test.cc'
         ]
 
@@ -49,6 +51,7 @@ def build(bld):
         'model/bulk-send-application.h',
         'model/onoff-application.h',
         'model/msg-generator-app.h',
+        'model/rate-controlled-flow-app.h',
         'model/rpc-workload-app.h',
         'model/packet-sink.h',
         'model/udp-client.h',
