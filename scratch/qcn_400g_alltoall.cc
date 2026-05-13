@@ -50,6 +50,7 @@ struct ExperimentStats
   std::array<uint32_t, 4> maxQueuePackets;
   std::array<uint32_t, 4> maxQueueBytes;
   std::array<uint64_t, 4> maxEgressSharedBytes;
+  std::array<uint64_t, 4> ecnAttempts;
   std::array<uint64_t, 4> ecnMarks;
   std::array<uint64_t, 4> qcnEvents;
   std::array<uint64_t, 4> pfcPauseEvents;
@@ -62,6 +63,7 @@ struct ExperimentStats
       maxQueuePackets ({0, 0, 0, 0}),
       maxQueueBytes ({0, 0, 0, 0}),
       maxEgressSharedBytes ({0, 0, 0, 0}),
+      ecnAttempts ({0, 0, 0, 0}),
       ecnMarks ({0, 0, 0, 0}),
       qcnEvents ({0, 0, 0, 0}),
       pfcPauseEvents ({0, 0, 0, 0}),
@@ -187,6 +189,34 @@ TraceQcnEvent (Ptr<OutputStreamWrapper> stream,
                         << " flowId=" << flowId
                         << " qPkts=" << packets
                         << " mdFactor=" << factor
+                        << std::endl;
+}
+
+void
+TraceEcnAttempt (Ptr<OutputStreamWrapper> stream,
+                 ExperimentStats* stats,
+                 bool writeEvents,
+                 uint32_t egressId,
+                 uint32_t sourceId,
+                 uint32_t flowId,
+                 uint32_t packets)
+{
+  if (stats && egressId < stats->ecnAttempts.size ())
+    {
+      stats->ecnAttempts[egressId]++;
+    }
+
+  if (!writeEvents)
+    {
+      return;
+    }
+
+  *stream->GetStream () << Simulator::Now ().GetNanoSeconds ()
+                        << " egressHost=" << OriginalHostId (egressId)
+                        << " sourceHost=" << OriginalHostId (sourceId)
+                        << " flowId=" << flowId
+                        << " qPkts=" << packets
+                        << " event=attempt"
                         << std::endl;
 }
 
@@ -327,7 +357,7 @@ WriteSummary (const std::string& path,
 
   out << "\n";
   out << "egressHost,queueEvents,maxQueuePackets,maxQueueBytes,maxObservedSharedBytes,"
-         "ecnMarks,qcnEvents,pfcPauseEvents,pfcResumeEvents\n";
+         "ecnAttempts,ecnMarks,qcnEvents,pfcPauseEvents,pfcResumeEvents\n";
   for (uint32_t egressId = 0; egressId < stats.queueEvents.size (); ++egressId)
     {
       out << OriginalHostId (egressId) << ","
@@ -335,6 +365,7 @@ WriteSummary (const std::string& path,
           << stats.maxQueuePackets[egressId] << ","
           << stats.maxQueueBytes[egressId] << ","
           << stats.maxEgressSharedBytes[egressId] << ","
+          << stats.ecnAttempts[egressId] << ","
           << stats.ecnMarks[egressId] << ","
           << stats.qcnEvents[egressId] << ","
           << stats.pfcPauseEvents[egressId] << ","
@@ -526,6 +557,11 @@ main (int argc, char* argv[])
                                                                 ecnStream,
                                                                 &stats,
                                                                 traceControlEvents));
+      qdiscs[i]->TraceConnectWithoutContext ("EcnAttempt",
+                                             MakeBoundCallback (&TraceEcnAttempt,
+                                                                ecnStream,
+                                                                &stats,
+                                                                traceControlEvents));
     }
 
   Ipv4AddressHelper ipv4;
@@ -561,6 +597,8 @@ main (int argc, char* argv[])
   for (const FlowConfig& flow : configs)
     {
       const Ipv4Address dstAddr = ifaces[flow.dstHost].GetAddress (1);
+      InetSocketAddress remote (dstAddr, flow.port);
+      remote.SetTos (0x02);
 
       PacketSinkHelper sinkHelper ("ns3::UdpSocketFactory",
                                    InetSocketAddress (Ipv4Address::GetAny (), flow.port));
@@ -571,7 +609,7 @@ main (int argc, char* argv[])
 
       Ptr<RateControlledFlowApp> app = CreateObject<RateControlledFlowApp> ();
       double initialRateGbps = flow.initialRateFraction * linkRateGbps;
-      app->SetAttribute ("Remote", AddressValue (InetSocketAddress (dstAddr, flow.port)));
+      app->SetAttribute ("Remote", AddressValue (remote));
       app->SetAttribute ("Protocol", TypeIdValue (UdpSocketFactory::GetTypeId ()));
       app->SetAttribute ("PacketSize", UintegerValue (packetSize));
       app->SetAttribute ("MaxBytes", UintegerValue (flow.bytes));

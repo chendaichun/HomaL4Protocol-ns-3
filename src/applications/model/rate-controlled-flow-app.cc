@@ -349,6 +349,9 @@ RateControlledFlowApp::SendPacket (void)
 
   Ptr<Packet> packet = Create<Packet> (remaining);
   packet->AddPacketTag (SwitchFlowIdTag (m_flowId, m_sourceId));
+  SocketIpTosTag ipTosTag;
+  ipTosTag.SetTos (m_ipTos);
+  packet->ReplacePacketTag (ipTosTag);
   int actual = m_socket->Send (packet);
   if (actual > 0)
     {

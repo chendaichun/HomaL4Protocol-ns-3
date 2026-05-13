@@ -89,6 +89,7 @@ private:
   TracedCallback<uint32_t, uint32_t, uint32_t, uint32_t> m_pfcTrace;
   TracedCallback<uint32_t, uint32_t, uint32_t, uint32_t, double> m_qcnTrace;
   TracedCallback<uint32_t, uint32_t, uint32_t, uint32_t> m_ecnTrace;
+  TracedCallback<uint32_t, uint32_t, uint32_t, uint32_t> m_ecnAttemptTrace;
 };
 
 } // namespace ns3

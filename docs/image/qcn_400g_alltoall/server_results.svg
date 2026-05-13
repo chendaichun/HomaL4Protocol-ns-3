@@ -1,0 +1,97 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1180" height="720" viewBox="0 0 1180 720">
+  <defs>
+    <style>
+      .bg { fill: #f8fafc; }
+      .panel { fill: #ffffff; stroke: #d9e2ec; stroke-width: 1.5; }
+      .title { font: 700 26px Arial, "Noto Sans CJK SC", sans-serif; fill: #102a43; }
+      .subtitle { font: 16px Arial, "Noto Sans CJK SC", sans-serif; fill: #486581; }
+      .label { font: 15px Arial, "Noto Sans CJK SC", sans-serif; fill: #243b53; }
+      .small { font: 13px Arial, "Noto Sans CJK SC", sans-serif; fill: #52606d; }
+      .tiny { font: 12px Arial, "Noto Sans CJK SC", sans-serif; fill: #627d98; }
+      .axis { stroke: #9fb3c8; stroke-width: 1; }
+      .grid { stroke: #edf2f7; stroke-width: 1; }
+      .bar-main { fill: #2b6cb0; }
+      .bar-ecn { fill: #2f855a; }
+      .bar-qcn { fill: #b7791f; }
+      .bar-pfc { fill: #c53030; }
+      .note { fill: #f0f4f8; stroke: #d9e2ec; stroke-width: 1; }
+      .ok { fill: #2f855a; font: 700 18px Arial, "Noto Sans CJK SC", sans-serif; }
+      .warn { fill: #b7791f; font: 700 18px Arial, "Noto Sans CJK SC", sans-serif; }
+      .num { font: 700 18px Arial, "Noto Sans CJK SC", sans-serif; fill: #102a43; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1180" height="720"/>
+  <text class="title" x="40" y="48">服务器实测结果与控制闭环验证</text>
+  <text class="subtitle" x="40" y="76">实验均在服务器 r75251 的 /home/r75251/hx/sird/HomaL4Protocol-ns-3 工作区运行，结果写入 /mnt/nasDisk_ds3617/sird/</text>
+
+  <rect class="panel" x="38" y="112" width="530" height="292" rx="8"/>
+  <text class="label" x="64" y="146">原始参数主场景：最大出口队列长度</text>
+  <text class="small" x="64" y="170">400G、4us、82MB、KMIN=700、KMAX=1600、PMAX=0.2、0.5s</text>
+
+  <line class="axis" x1="104" y1="344" x2="520" y2="344"/>
+  <line class="axis" x1="104" y1="204" x2="104" y2="344"/>
+  <line class="grid" x1="104" y1="297" x2="520" y2="297"/>
+  <line class="grid" x1="104" y1="250" x2="520" y2="250"/>
+  <text class="tiny" x="70" y="348">0</text>
+  <text class="tiny" x="70" y="301">1</text>
+  <text class="tiny" x="70" y="254">2</text>
+  <text class="tiny" x="70" y="207">3 pkt</text>
+
+  <rect class="bar-main" x="142" y="297" width="48" height="47"/>
+  <rect class="bar-main" x="234" y="204" width="48" height="140"/>
+  <rect class="bar-main" x="326" y="297" width="48" height="47"/>
+  <rect class="bar-main" x="418" y="204" width="48" height="140"/>
+  <text class="num" x="158" y="291">1</text>
+  <text class="num" x="250" y="198">3</text>
+  <text class="num" x="342" y="291">1</text>
+  <text class="num" x="434" y="198">3</text>
+  <text class="small" x="139" y="370">egress 1</text>
+  <text class="small" x="231" y="370">egress 2</text>
+  <text class="small" x="323" y="370">egress 3</text>
+  <text class="small" x="415" y="370">egress 4</text>
+
+  <rect class="note" x="64" y="382" width="478" height="0"/>
+  <text class="small" x="64" y="392">KMIN=700 包，主场景队列峰值最多 3 包，远低于 ECN/QCN/PFC 触发阈值。</text>
+
+  <rect class="panel" x="612" y="112" width="528" height="292" rx="8"/>
+  <text class="label" x="638" y="146">原始参数主场景：完成度与共享缓存</text>
+  <text class="small" x="638" y="170">12 条流均为 100,000,000B，开始时间 40us。</text>
+
+  <text class="ok" x="662" y="224">12 / 12 条流完成</text>
+  <text class="small" x="662" y="250">每条流接收字节均为 100,000,000B，completionRatio=1。</text>
+
+  <text class="num" x="662" y="300">20,140 B</text>
+  <text class="small" x="760" y="300">共享缓存峰值</text>
+  <text class="tiny" x="662" y="326">约 5 个 4028B 以太网帧占用，远小于 82MB 共享缓存。</text>
+
+  <text class="warn" x="662" y="374">ECN/QCN/PFC 主场景均为 0</text>
+  <text class="small" x="662" y="398">这不是平台失效，而是该流量矩阵在 400G 链路下未形成足够深的出口排队。</text>
+
+  <rect class="panel" x="38" y="438" width="1102" height="214" rx="8"/>
+  <text class="label" x="64" y="472">低阈值 stress-smoke：分别验证三类控制信号可以触发并反馈到发送端</text>
+  <text class="small" x="64" y="496">这些验证不替代主场景结论，只证明平台具备 ECN 标记、QCN 降速、PFC pause/resume 的闭环能力。</text>
+
+  <line class="axis" x1="102" y1="604" x2="1066" y2="604"/>
+  <line class="grid" x1="102" y1="554" x2="1066" y2="554"/>
+
+  <rect class="bar-ecn" x="142" y="514" width="126" height="90"/>
+  <text class="num" x="157" y="506">11,734</text>
+  <text class="small" x="138" y="628">ECN marks</text>
+  <text class="tiny" x="124" y="648">ECN-only, 1ms</text>
+
+  <rect class="bar-qcn" x="386" y="584" width="126" height="20"/>
+  <text class="num" x="420" y="576">12</text>
+  <text class="small" x="388" y="628">QCN events</text>
+  <text class="tiny" x="362" y="648">rate trace 155 行</text>
+
+  <rect class="bar-pfc" x="630" y="492" width="126" height="112"/>
+  <text class="num" x="642" y="484">23,921</text>
+  <text class="small" x="625" y="628">PFC pause</text>
+  <text class="tiny" x="600" y="648">resume 同为 23,921</text>
+
+  <rect class="note" x="858" y="516" width="238" height="92" rx="6"/>
+  <text class="small" x="878" y="544">读图结论</text>
+  <text class="tiny" x="878" y="570">主场景验证“能运行且不拥塞”；</text>
+  <text class="tiny" x="878" y="592">stress-smoke 验证三类反馈链路存在。</text>
+</svg>

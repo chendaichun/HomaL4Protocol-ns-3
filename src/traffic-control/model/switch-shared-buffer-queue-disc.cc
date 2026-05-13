@@ -135,6 +135,10 @@ SwitchSharedBufferQueueDisc::GetTypeId (void)
                      "ECN mark event: egressId, sourceId, flowId, queuePackets.",
                      MakeTraceSourceAccessor (&SwitchSharedBufferQueueDisc::m_ecnTrace),
                      "ns3::TracedCallback::Uint32Uint32Uint32Uint32")
+    .AddTraceSource ("EcnAttempt",
+                     "ECN threshold hit before trying to set CE: egressId, sourceId, flowId, queuePackets.",
+                     MakeTraceSourceAccessor (&SwitchSharedBufferQueueDisc::m_ecnAttemptTrace),
+                     "ns3::TracedCallback::Uint32Uint32Uint32Uint32")
   ;
   return tid;
 }
@@ -233,6 +237,10 @@ SwitchSharedBufferQueueDisc::DoEnqueue (Ptr<QueueDiscItem> item)
   bool marked = false;
   if (m_useEcn && ShouldMark (occupancyPackets))
     {
+      m_ecnAttemptTrace (m_egressId,
+                         GetItemSourceId (item),
+                         GetItemFlowId (item),
+                         occupancyPackets);
       marked = Mark (item, ECN_MARK);
       if (marked)
         {
